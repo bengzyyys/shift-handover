@@ -102,7 +102,11 @@ func FormatEntry(e HandoverEntry) string {
 		e.ItemID, e.Status.Label(), e.Severity.Label(), e.FollowOwner)
 	fmt.Fprintf(&b, "  原文：%s\n", e.Content)
 	fmt.Fprintf(&b, "  限制条件：%s\n", dashIfEmpty(e.Constraints))
-	fmt.Fprintf(&b, "  最后处理：操作人=%s 时间=%s\n", dashIfEmpty(e.Operator), fmtTimePtr(e.ProcessedAt))
+	if e.ProcessedAt == nil {
+		b.WriteString("  最后处理：尚未处理（等待接班人处理）\n")
+	} else {
+		fmt.Fprintf(&b, "  最后处理：操作人=%s 时间=%s\n", dashIfEmpty(e.Operator), fmtTimePtr(e.ProcessedAt))
+	}
 	if e.Status == EntryTracking || e.TrackingNote != "" {
 		fmt.Fprintf(&b, "  跟踪说明：%s\n", dashIfEmpty(e.TrackingNote))
 		fmt.Fprintf(&b, "  跟踪后续负责人：%s\n", dashIfEmpty(e.FollowOwner))
@@ -111,7 +115,7 @@ func FormatEntry(e HandoverEntry) string {
 		fmt.Fprintf(&b, "  第%d次退回：%s 操作人=%s 原因=%s\n",
 			r.Seq, fmtTime(r.ReturnedAt), r.ReturnOperator, r.Reason)
 		if r.Supplement != "" {
-			fmt.Fprintf(&b, "    补充说明：%s 操作人=%s 时间=%s\n",
+			fmt.Fprintf(&b, "    补充说明：%s 补充人=%s 补充时间=%s\n",
 				r.Supplement, dashIfEmpty(r.SupplementOperator), fmtTimePtr(r.SupplementAt))
 		}
 		if r.ResubmittedAt != nil {
@@ -209,15 +213,22 @@ func FormatReport(rep ShiftReport) string {
 	for _, id := range ids {
 		views := rep.Results[id]
 		for _, v := range views {
+			operator, processedAt := dashIfEmpty(v.Entry.Operator), fmtTimePtr(v.Entry.ProcessedAt)
+			if v.Entry.ProcessedAt == nil {
+				operator, processedAt = "尚未处理", "尚未处理"
+			}
 			fmt.Fprintf(&b, "  事项 %s 交接 %s（%s -> %s）当前结果：%s；处理人=%s；处理时间=%s\n",
 				id, v.HandoverID, v.FromShift, v.ToShift,
-				v.Entry.Status.Label(), dashIfEmpty(v.Entry.Operator), fmtTimePtr(v.Entry.ProcessedAt))
+				v.Entry.Status.Label(), operator, processedAt)
 			for _, r := range v.Entry.Rounds {
 				fmt.Fprintf(&b, "    第%d次退回：操作人=%s 时间=%s 原因=%s\n",
 					r.Seq, r.ReturnOperator, fmtTime(r.ReturnedAt), r.Reason)
 				if r.Supplement != "" {
-					fmt.Fprintf(&b, "      补充：%s（%s，%s）\n",
+					fmt.Fprintf(&b, "      补充：%s（补充人=%s，补充时间=%s）\n",
 						r.Supplement, dashIfEmpty(r.SupplementOperator), fmtTimePtr(r.SupplementAt))
+				}
+				if r.ResubmittedAt != nil {
+					fmt.Fprintf(&b, "      已重新提交：%s\n", fmtTime(*r.ResubmittedAt))
 				}
 			}
 		}

@@ -507,6 +507,8 @@ func (svc *Service) CreateHandover(fromShiftID, toShiftID string) (Handover, err
 
 // ProcessEntry 由接班人逐项处理交接事项，须填写操作人。
 // action 为 confirm（确认接收）、return（退回，须填原因）或 track（继续跟踪，须填跟踪说明和后续负责人）。
+// 已退回项表示等待交班人补充，只有在原交接记录上成功重新提交、恢复待处理后才能再次
+// 确认、继续跟踪或退回；未重新提交前直接处理一律返回状态错误，且不改变任何数据。
 func (svc *Service) ProcessEntry(handoverID, itemID string, action EntryAction, operator, reason, trackingNote, nextFollowOwner string) (Handover, error) {
 	handoverID = clean(handoverID)
 	itemID = clean(itemID)
@@ -535,6 +537,13 @@ func (svc *Service) ProcessEntry(handoverID, itemID string, action EntryAction, 
 		if e.Status.Received() {
 			return fmt.Errorf("%w：事项 %s 已%s，不能重复处理或退回",
 				ErrHandoverState, e.ItemID, e.Status.Label())
+		}
+		if e.Status == EntryReturned {
+			// 退回表示等待交班人补充：必须先在原交接记录上补充说明并重新提交，
+			// 该项恢复待处理后才能再次确认、继续跟踪或退回。即使本次填写了
+			// 操作人、退回原因或跟踪说明，也不能跳过这一步。
+			return fmt.Errorf("%w：事项 %s 已退回，正等待交班人补充说明并在原交接记录 %s 上重新提交；请先完成补充并重新提交后再处理",
+				ErrHandoverState, e.ItemID, h.ID)
 		}
 		switch action {
 		case ActionReturn:
@@ -606,7 +615,11 @@ func contains(xs []string, x string) bool {
 }
 
 // ResubmitReturned 由交班人对退回项追加非空说明并在同一交接记录上重新提交；
-// 只有该项恢复待处理，既有接收结果、原文与退回原因均不变。
+// 补充写入最近一次退回记录（保留该轮原因、退回人和退回时间，并记录补充人、
+// 补充时间与重新提交时间），以前各轮说明不覆盖。只有该项恢复待处理，当前结果的
+// 接班处理人与处理时间显示为尚未处理；原文、严重程度、限制条件不变，事项仍留在
+// 交班班次，同一交接的其他事项不受影响。重新提交本身不表示接收。
+// 对待处理、已确认或继续跟踪的事项重新提交报状态错误，不写入补充说明。
 func (svc *Service) ResubmitReturned(handoverID, itemID, operator, supplement string) (Handover, error) {
 	handoverID = clean(handoverID)
 	itemID = clean(itemID)
@@ -645,7 +658,11 @@ func (svc *Service) ResubmitReturned(handoverID, itemID, operator, supplement st
 		round.SupplementOperator = operator
 		round.SupplementAt = &now
 		round.ResubmittedAt = &now
+		// 仅这一个事项恢复待处理：当前结果的接班处理人与处理时间显示为
+		// 尚未处理；上一轮退回信息仍完整保留在 Rounds 历史中。
 		e.Status = EntryPending
+		e.Operator = ""
+		e.ProcessedAt = nil
 		result = *h
 		return nil
 	})

@@ -1115,3 +1115,378 @@ func TestOpenShiftReportListsItemsOnce(t *testing.T) {
 		t.Fatalf("事项清单应按编号排列")
 	}
 }
+
+// findEntryOf 从交接记录中取出指定事项的当前记录。
+func findEntryOf(t *testing.T, h Handover, itemID string) *HandoverEntry {
+	t.Helper()
+	for i := range h.Entries {
+		if h.Entries[i].ItemID == itemID {
+			return &h.Entries[i]
+		}
+	}
+	t.Fatalf("交接 %s 中缺少事项 %s", h.ID, itemID)
+	return nil
+}
+
+// TestReturnedMustWaitForResubmit：退回表示等待交班人补充；未重新提交前，
+// 确认、继续跟踪、再次退回应报状态错误，且不增加退回轮次、不覆盖上次处理人
+// 与时间、不调整后续负责人、不移动事项班次，交接完成情况也不变。
+func TestReturnedMustWaitForResubmit(t *testing.T) {
+	f := newFixture(t)
+	a, b, items := prepareHandover(t, f)
+	h, _ := f.svc.CreateHandover(a.ID, b.ID)
+	idA, idB := items[0].ID, items[1].ID
+
+	if _, err := f.svc.ProcessEntry(h.ID, idA, ActionReturn, "李四", "信息不全，需补充图纸", "", ""); err != nil {
+		t.Fatalf("return: %v", err)
+	}
+	if _, err := f.svc.ProcessEntry(h.ID, idB, ActionConfirm, "李四", "", "", ""); err != nil {
+		t.Fatalf("confirm idB: %v", err)
+	}
+
+	before, _ := f.svc.GetHandover(h.ID)
+	eaBefore := findEntryOf(t, before, idA)
+	returnedAt := eaBefore.ProcessedAt
+	if eaBefore.Status != EntryReturned || len(eaBefore.Rounds) != 1 {
+		t.Fatalf("前置状态应为退回且只有1轮：%+v", eaBefore)
+	}
+	if eaBefore.Operator != "李四" {
+		t.Fatalf("前置处理人应为退回人李四")
+	}
+
+	// 即使填了操作人、退回原因、跟踪说明与后续负责人，也不能跳过重新提交。
+	try := func(act EntryAction, reason, note, follow string) {
+		t.Helper()
+		if _, err := f.svc.ProcessEntry(h.ID, idA, act, "接班人王五", reason, note, follow); !errors.Is(err, ErrHandoverState) {
+			t.Fatalf("退回未重新提交时 %s 应报 ErrHandoverState，got %v", act, err)
+		}
+	}
+	try(ActionConfirm, "", "", "")
+	try(ActionConfirm, "硬塞退回原因", "硬塞跟踪说明", "硬塞负责人")
+	try(ActionTrack, "", "继续跟踪说明", "王五")
+	try(ActionReturn, "第二次退回原因", "", "")
+
+	got, _ := f.svc.GetHandover(h.ID)
+	ea := findEntryOf(t, got, idA)
+	if ea.Status != EntryReturned {
+		t.Fatalf("失败后状态仍应为退回，got %s", ea.Status)
+	}
+	if len(ea.Rounds) != 1 {
+		t.Fatalf("失败处理不应增加退回轮次，got %d", len(ea.Rounds))
+	}
+	r := ea.Rounds[0]
+	if r.Reason != "信息不全，需补充图纸" || r.ReturnOperator != "李四" {
+		t.Fatalf("上一轮退回原因与退回人不得覆盖：%+v", r)
+	}
+	if r.Supplement != "" || r.SupplementOperator != "" || r.ResubmittedAt != nil {
+		t.Fatalf("失败处理不得写入补充或重新提交信息：%+v", r)
+	}
+	if ea.Operator != "李四" || ea.ProcessedAt == nil || !ea.ProcessedAt.Equal(*returnedAt) {
+		t.Fatalf("上次处理人和时间不得被覆盖：op=%s at=%v want %s %s",
+			ea.Operator, ea.ProcessedAt, "李四", returnedAt)
+	}
+	if ea.FollowOwner != "李四" || ea.TrackingNote != "" {
+		t.Fatalf("失败处理不得调整后续负责人或留下跟踪说明：%+v", ea)
+	}
+
+	it, _ := f.svc.GetItem(idA)
+	if it.CurrentShiftID != a.ID || it.FollowOwner != "李四" {
+		t.Fatalf("失败处理不得移动事项班次或改负责人：%+v", it)
+	}
+	if got.Completed() || got.CompletedAt != nil {
+		t.Fatalf("交接完成情况不得变化，应仍未完成")
+	}
+	eb := findEntryOf(t, got, idB)
+	if eb.Status != EntryConfirmed {
+		t.Fatalf("其他事项结果不应受影响：%s", eb.Status)
+	}
+
+	// 接班班次仍因退回项不能结束。
+	if _, err := f.svc.CloseShift(b.ID); !errors.Is(err, ErrHandoverState) {
+		t.Fatalf("退回项未处理完时接班班次不能结束，got %v", err)
+	}
+
+	// 退出重开后仍按保存的状态拦截。
+	f.reopen(t)
+	if _, err := f.svc.ProcessEntry(h.ID, idA, ActionConfirm, "李四", "", "", ""); !errors.Is(err, ErrHandoverState) {
+		t.Fatalf("重开后退回项仍应拦截，got %v", err)
+	}
+
+	// 成功重新提交后仅该项恢复待处理，接班处理人与处理时间显示为尚未处理。
+	if _, err := f.svc.ResubmitReturned(h.ID, idA, "张三", "图纸编号已补到资料柜B层"); err != nil {
+		t.Fatalf("resubmit: %v", err)
+	}
+	got, _ = f.svc.GetHandover(h.ID)
+	ea = findEntryOf(t, got, idA)
+	if ea.Status != EntryPending || ea.Operator != "" || ea.ProcessedAt != nil {
+		t.Fatalf("重新提交后应恢复待处理且接班处理信息清空（尚未处理）：%+v", ea)
+	}
+	r = ea.Rounds[0]
+	if r.Reason != "信息不全，需补充图纸" || r.ReturnOperator != "李四" || !r.ReturnedAt.Equal(*returnedAt) {
+		t.Fatalf("本轮退回原因、退回人、退回时间应保留：%+v", r)
+	}
+	if r.Supplement != "图纸编号已补到资料柜B层" || r.SupplementOperator != "张三" ||
+		r.SupplementAt == nil || r.ResubmittedAt == nil {
+		t.Fatalf("应记录补充人、补充时间与重新提交时间：%+v", r)
+	}
+	it, _ = f.svc.GetItem(idA)
+	if it.CurrentShiftID != a.ID {
+		t.Fatalf("重新提交本身不表示接收，事项仍应留在交班班次")
+	}
+	if it.Content != ea.Content || string(it.Severity) != string(ea.Severity) || it.Constraints != ea.Constraints {
+		t.Fatalf("重新提交不得改变原文、严重程度和限制条件")
+	}
+
+	// 重新提交后接班人可以正常确认接收。
+	if _, err := f.svc.ProcessEntry(h.ID, idA, ActionConfirm, "李四", "", "", ""); err != nil {
+		t.Fatalf("重新提交后确认应成功：%v", err)
+	}
+	got, _ = f.svc.GetHandover(h.ID)
+	if !got.Completed() || got.CompletedAt == nil {
+		t.Fatalf("全部接收后交接才完成")
+	}
+}
+
+// TestEachReturnRoundRequiresOwnResubmit：再次退回才产生下一轮并重新等待补充；
+// 此前某一轮已有补充不能代替新一轮的重新提交。
+func TestEachReturnRoundRequiresOwnResubmit(t *testing.T) {
+	f := newFixture(t)
+	a, b, items := prepareHandover(t, f)
+	h, _ := f.svc.CreateHandover(a.ID, b.ID)
+	idA := items[0].ID
+	// 另一项直接确认，避免交接提前进入完成态的干扰。
+	if _, err := f.svc.ProcessEntry(h.ID, items[1].ID, ActionConfirm, "李四", "", "", ""); err != nil {
+		t.Fatalf("confirm other: %v", err)
+	}
+
+	if _, err := f.svc.ProcessEntry(h.ID, idA, ActionReturn, "李四", "第一轮原因", "", ""); err != nil {
+		t.Fatalf("return 1: %v", err)
+	}
+	if _, err := f.svc.ResubmitReturned(h.ID, idA, "张三", "第一轮补充"); err != nil {
+		t.Fatalf("resubmit 1: %v", err)
+	}
+	if _, err := f.svc.ProcessEntry(h.ID, idA, ActionReturn, "李四", "第二轮原因", "", ""); err != nil {
+		t.Fatalf("return 2: %v", err)
+	}
+
+	got, _ := f.svc.GetHandover(h.ID)
+	ea := findEntryOf(t, got, idA)
+	if len(ea.Rounds) != 2 {
+		t.Fatalf("再次退回应产生第2轮，got %d", len(ea.Rounds))
+	}
+
+	// 第一轮补充不能代替第二轮的重新提交。
+	if _, err := f.svc.ProcessEntry(h.ID, idA, ActionConfirm, "李四", "", "", ""); !errors.Is(err, ErrHandoverState) {
+		t.Fatalf("第二轮退回后必须重新提交，got %v", err)
+	}
+	if _, err := f.svc.ProcessEntry(h.ID, idA, ActionTrack, "李四", "", "说明", "王五"); !errors.Is(err, ErrHandoverState) {
+		t.Fatalf("第二轮退回后继续跟踪也必须拦截，got %v", err)
+	}
+	got, _ = f.svc.GetHandover(h.ID)
+	ea = findEntryOf(t, got, idA)
+	r1, r2 := ea.Rounds[0], ea.Rounds[1]
+	if r1.Reason != "第一轮原因" || r1.Supplement != "第一轮补充" || r1.SupplementOperator != "张三" {
+		t.Fatalf("第一轮记录不得被覆盖：%+v", r1)
+	}
+	if r2.Reason != "第二轮原因" || r2.ReturnOperator != "李四" ||
+		r2.Supplement != "" || r2.ResubmittedAt != nil {
+		t.Fatalf("第二轮应保留新退回原因且尚无补充：%+v", r2)
+	}
+	if ea.Status != EntryReturned {
+		t.Fatalf("拦截后仍应为退回")
+	}
+
+	if _, err := f.svc.ResubmitReturned(h.ID, idA, "张三", "第二轮补充"); err != nil {
+		t.Fatalf("resubmit 2: %v", err)
+	}
+	if _, err := f.svc.ProcessEntry(h.ID, idA, ActionTrack, "李四", "", "持续跟进", "王五"); err != nil {
+		t.Fatalf("第二轮重新提交后应能继续跟踪：%v", err)
+	}
+	got, _ = f.svc.GetHandover(h.ID)
+	ea = findEntryOf(t, got, idA)
+	if ea.Status != EntryTracking || ea.Operator != "李四" || ea.ProcessedAt == nil {
+		t.Fatalf("继续跟踪应只处理一次并记录处理人/时间：%+v", ea)
+	}
+	if len(ea.Rounds) != 2 {
+		t.Fatalf("两轮历史都应保留")
+	}
+	if ea.Rounds[0].Supplement != "第一轮补充" {
+		t.Fatalf("第一轮补充不得被第二轮覆盖：%+v", ea.Rounds[0])
+	}
+	it, _ := f.svc.GetItem(idA)
+	if it.CurrentShiftID != b.ID || it.FollowOwner != "王五" {
+		t.Fatalf("继续跟踪后事项应进入接班班次并更新后续负责人：%+v", it)
+	}
+	// 已接收项不能再退回，也不能重新提交。
+	if _, err := f.svc.ProcessEntry(h.ID, idA, ActionReturn, "李四", "再退", "", ""); !errors.Is(err, ErrHandoverState) {
+		t.Fatalf("已接收项不能退回，got %v", err)
+	}
+	if _, err := f.svc.ResubmitReturned(h.ID, idA, "张三", "不应写入"); !errors.Is(err, ErrHandoverState) {
+		t.Fatalf("继续跟踪项不能重新提交，got %v", err)
+	}
+}
+
+// TestResubmitStateAndInputRules：只有退回项可重新提交；待处理、已确认、
+// 继续跟踪都报状态错误且不写入补充；操作人必填、纯空格补充视为空。
+func TestResubmitStateAndInputRules(t *testing.T) {
+	f := newFixture(t)
+	a, b, items := prepareHandover(t, f)
+	h, _ := f.svc.CreateHandover(a.ID, b.ID)
+	idA, idB := items[0].ID, items[1].ID
+
+	// 待处理项重新提交：状态错误，不写入。
+	if _, err := f.svc.ResubmitReturned(h.ID, idA, "张三", "补充内容"); !errors.Is(err, ErrHandoverState) {
+		t.Fatalf("待处理项重新提交应报 ErrHandoverState，got %v", err)
+	}
+	got, _ := f.svc.GetHandover(h.ID)
+	ea := findEntryOf(t, got, idA)
+	if len(ea.Rounds) != 0 || ea.Status != EntryPending {
+		t.Fatalf("状态错误时不应写入补充或退回记录：%+v", ea)
+	}
+
+	// 已确认项重新提交：状态错误。
+	if _, err := f.svc.ProcessEntry(h.ID, idA, ActionConfirm, "李四", "", "", ""); err != nil {
+		t.Fatalf("confirm: %v", err)
+	}
+	if _, err := f.svc.ResubmitReturned(h.ID, idA, "张三", "补充内容"); !errors.Is(err, ErrHandoverState) {
+		t.Fatalf("已确认项重新提交应报错，got %v", err)
+	}
+
+	// 继续跟踪项重新提交：状态错误。
+	if _, err := f.svc.ProcessEntry(h.ID, idB, ActionTrack, "李四", "", "盯住", "王五"); err != nil {
+		t.Fatalf("track: %v", err)
+	}
+	if _, err := f.svc.ResubmitReturned(h.ID, idB, "张三", "补充内容"); !errors.Is(err, ErrHandoverState) {
+		t.Fatalf("继续跟踪项重新提交应报错，got %v", err)
+	}
+
+	// 退回后：操作人缺失、纯空格补充均为输入错误，且不写入。idA/idB 都已接收，
+	// 另起一套数据制造退回项。
+	f2 := newFixture(t)
+	a2, b2, items2 := prepareHandover(t, f2)
+	h3, _ := f2.svc.CreateHandover(a2.ID, b2.ID)
+	id := items2[0].ID
+	if _, err := f2.svc.ProcessEntry(h3.ID, id, ActionReturn, "李四", "需补充", "", ""); err != nil {
+		t.Fatalf("return: %v", err)
+	}
+	if _, err := f2.svc.ResubmitReturned(h3.ID, id, "   ", "补充"); !errors.Is(err, ErrInvalidInput) {
+		t.Fatalf("操作人必填，got %v", err)
+	}
+	if _, err := f2.svc.ResubmitReturned(h3.ID, id, "张三", "   "); !errors.Is(err, ErrInvalidInput) {
+		t.Fatalf("纯空格补充说明应视为空，got %v", err)
+	}
+	g, _ := f2.svc.GetHandover(h3.ID)
+	e := findEntryOf(t, g, id)
+	if e.Status != EntryReturned || len(e.Rounds) != 1 || e.Rounds[0].Supplement != "" ||
+		e.Rounds[0].ResubmittedAt != nil || e.Operator != "李四" {
+		t.Fatalf("输入校验失败不得写入任何内容：%+v", e)
+	}
+	if _, err := f2.svc.ResubmitReturned(h3.ID, "I999", "张三", "补充"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("清单外事项应 ErrNotFound，got %v", err)
+	}
+	if _, err := f2.svc.ResubmitReturned("H999", id, "张三", "补充"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("不存在交接应 ErrNotFound，got %v", err)
+	}
+
+	// 重复重新提交已恢复待处理的事项也要报状态错误（不能二次写入同一轮）。
+	if _, err := f2.svc.ResubmitReturned(h3.ID, id, "张三", "第一次补充"); err != nil {
+		t.Fatalf("first resubmit: %v", err)
+	}
+	if _, err := f2.svc.ResubmitReturned(h3.ID, id, "张三", "再次补充"); !errors.Is(err, ErrHandoverState) {
+		t.Fatalf("已重新提交、等待处理的事项不能再次补充提交，got %v", err)
+	}
+	g, _ = f2.svc.GetHandover(h3.ID)
+	e = findEntryOf(t, g, id)
+	if e.Rounds[0].Supplement != "第一次补充" {
+		t.Fatalf("重复重新提交失败不得覆盖原补充：%+v", e.Rounds[0])
+	}
+}
+
+// TestReturnedQueriesShowPendingAsUnprocessed：交接查询与按班次查询一致展示
+// 当前结果与逐轮退回、补充记录；重新提交后接班处理人和处理时间显示尚未处理。
+func TestReturnedQueriesShowPendingAsUnprocessed(t *testing.T) {
+	f := newFixture(t)
+	a, b, items := prepareHandover(t, f)
+	h, _ := f.svc.CreateHandover(a.ID, b.ID)
+	idA := items[0].ID
+
+	if _, err := f.svc.ProcessEntry(h.ID, idA, ActionReturn, "李四", "需补充图纸", "", ""); err != nil {
+		t.Fatalf("return: %v", err)
+	}
+	if _, err := f.svc.ResubmitReturned(h.ID, idA, "张三", "图纸在B层"); err != nil {
+		t.Fatalf("resubmit: %v", err)
+	}
+
+	htext := FormatHandover(mustGetHandover(t, f, h.ID))
+	if !strings.Contains(htext, "尚未处理") {
+		t.Fatalf("交接查询应把恢复待处理项显示为尚未处理：\n%s", htext)
+	}
+	if !strings.Contains(htext, "第1次退回") || !strings.Contains(htext, "需补充图纸") ||
+		!strings.Contains(htext, "图纸在B层") || !strings.Contains(htext, "已重新提交") {
+		t.Fatalf("交接查询应逐轮展示退回原因、补充与重新提交：\n%s", htext)
+	}
+
+	rep, err := f.svc.ShiftReport(b.ID)
+	if err != nil {
+		t.Fatalf("report: %v", err)
+	}
+	rtext := FormatReport(rep)
+	if !strings.Contains(rtext, "处理人=尚未处理") || !strings.Contains(rtext, "处理时间=尚未处理") {
+		t.Fatalf("按班次查询当前结果应显示尚未处理：\n%s", rtext)
+	}
+	if !strings.Contains(rtext, "第1次退回") || !strings.Contains(rtext, "图纸在B层") ||
+		!strings.Contains(rtext, "已重新提交") {
+		t.Fatalf("按班次查询应逐轮展示退回与补充、重新提交记录：\n%s", rtext)
+	}
+}
+
+func mustGetHandover(t *testing.T, f *fixture, id string) Handover {
+	t.Helper()
+	h, err := f.svc.GetHandover(id)
+	if err != nil {
+		t.Fatalf("get handover: %v", err)
+	}
+	return h
+}
+
+// TestReturnedStatePersistsAcrossReopen：退回后退出重开，未重新提交仍不能处理；
+// 重新提交与后续处理、完成状态在重开后均保留。
+func TestReturnedStatePersistsAcrossReopen(t *testing.T) {
+	f := newFixture(t)
+	a, b, items := prepareHandover(t, f)
+	h, _ := f.svc.CreateHandover(a.ID, b.ID)
+	idA, idB := items[0].ID, items[1].ID
+	if _, err := f.svc.ProcessEntry(h.ID, idA, ActionReturn, "李四", "需补充", "", ""); err != nil {
+		t.Fatalf("return: %v", err)
+	}
+	if _, err := f.svc.ProcessEntry(h.ID, idB, ActionConfirm, "李四", "", "", ""); err != nil {
+		t.Fatalf("confirm: %v", err)
+	}
+
+	f.reopen(t)
+	if _, err := f.svc.ProcessEntry(h.ID, idA, ActionReturn, "李四", "再退一轮", "", ""); !errors.Is(err, ErrHandoverState) {
+		t.Fatalf("重开后未重新提交仍不能再次退回，got %v", err)
+	}
+	g, _ := f.svc.GetHandover(h.ID)
+	e := findEntryOf(t, g, idA)
+	if e.Status != EntryReturned || len(e.Rounds) != 1 || e.Operator != "李四" {
+		t.Fatalf("重开后退回状态与轮次应原样保留：%+v", e)
+	}
+	if _, err := f.svc.ResubmitReturned(h.ID, idA, "张三", "补充材料"); err != nil {
+		t.Fatalf("重开后应能补充重新提交：%v", err)
+	}
+
+	f.reopen(t)
+	g, _ = f.svc.GetHandover(h.ID)
+	e = findEntryOf(t, g, idA)
+	if e.Status != EntryPending || e.Operator != "" || e.ProcessedAt != nil {
+		t.Fatalf("重开后应保持待处理且尚未处理：%+v", e)
+	}
+	if _, err := f.svc.ProcessEntry(h.ID, idA, ActionConfirm, "李四", "", "", ""); err != nil {
+		t.Fatalf("重开后应能确认接收：%v", err)
+	}
+	g, _ = f.svc.GetHandover(h.ID)
+	if !g.Completed() {
+		t.Fatalf("重开后续办完成应保留")
+	}
+}
