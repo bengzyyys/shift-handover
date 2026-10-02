@@ -65,6 +65,34 @@ func dashIfEmpty(s string) string {
 	return s
 }
 
+// FormatCloseRecord 格式化班次结束成功时为单个事项留下的不可变记录。
+// 其中的关闭情况只反映结束那一刻：结束后由后续班次关闭的事项仍显示“结束时未关闭”。
+func FormatCloseRecord(r ShiftItemRecord) string {
+	var b strings.Builder
+	if r.Closed {
+		fmt.Fprintf(&b, "%s  严重程度=%s  原始班次=%s  [结束时已关闭（%s 于 %s）]\n",
+			r.ID, r.Severity.Label(), r.OriginShiftID,
+			dashIfEmpty(r.CloseOperator), fmtTimePtr(r.ClosedAt))
+	} else {
+		b.WriteString(r.ID + "  严重程度=" + r.Severity.Label() +
+			"  原始班次=" + r.OriginShiftID + "  [结束时未关闭]\n")
+	}
+	fmt.Fprintf(&b, "  内容：%s\n", r.Content)
+	fmt.Fprintf(&b, "  限制条件：%s\n", dashIfEmpty(r.Constraints))
+	fmt.Fprintf(&b, "  后续负责人：%s\n", r.FollowOwner)
+	return b.String()
+}
+
+// FormatItemLatest 格式化事项的最新信息，用于已结束班次报告中与结束时记录并列对照。
+func FormatItemLatest(it Item) string {
+	state := "未关闭"
+	if it.Closed {
+		state = fmt.Sprintf("已关闭（%s 于 %s）", dashIfEmpty(it.CloseOperator), fmtTimePtr(it.ClosedAt))
+	}
+	return fmt.Sprintf("%s  当前班次=%s  最新后续负责人=%s  最新关闭情况：%s  内容：%s",
+		it.ID, it.CurrentShiftID, it.FollowOwner, state, it.Content)
+}
+
 // FormatOverlapNote 格式化重叠说明。
 func FormatOverlapNote(n OverlapNote) string {
 	return fmt.Sprintf("%s  岗位=%s  班次 %s <-> %s  %s\n  说明：%s",
@@ -132,12 +160,40 @@ func FormatReport(rep ShiftReport) string {
 		b.WriteString(indentLines(FormatOverlapNote(n), "  "))
 	}
 
-	b.WriteString("\n事项：\n")
-	if len(rep.Items) == 0 {
-		b.WriteString("  （无）\n")
-	}
-	for _, it := range rep.Items {
-		b.WriteString(indentLines(FormatItem(it), "  "))
+	switch {
+	case rep.Shift.Closed && rep.Shift.CloseSnapshot != nil:
+		fmt.Fprintf(&b, "\n事项（结束时记录，记录于 %s）：\n", fmtTime(rep.Shift.CloseSnapshot.ClosedAt))
+		if len(rep.CloseItems) == 0 {
+			b.WriteString("  （本班结束成功时没有事项）\n")
+		}
+		for _, r := range rep.CloseItems {
+			b.WriteString(indentLines(FormatCloseRecord(r), "  "))
+		}
+		// 最新信息随后续办理变化，与上面的结束时事实明确区分。
+		b.WriteString("\n最新信息（非结束时记录，随后续办理变化）：\n")
+		if len(rep.LatestItems) == 0 {
+			b.WriteString("  （无）\n")
+		}
+		for _, it := range rep.LatestItems {
+			b.WriteString(indentLines(FormatItemLatest(it), "  "))
+		}
+	case rep.Shift.Closed:
+		b.WriteString("\n事项：\n")
+		b.WriteString("  历史记录不完整，以下为当前信息（非结束时记录，不能视为本班结束时事实）：\n")
+		if len(rep.LegacyItems) == 0 {
+			b.WriteString("    （无）\n")
+		}
+		for _, it := range rep.LegacyItems {
+			b.WriteString(indentLines(FormatItem(it), "    "))
+		}
+	default:
+		b.WriteString("\n事项（进行中，当前信息）：\n")
+		if len(rep.OpenItems) == 0 {
+			b.WriteString("  （无）\n")
+		}
+		for _, it := range rep.OpenItems {
+			b.WriteString(indentLines(FormatItem(it), "  "))
+		}
 	}
 
 	b.WriteString("\n交班对象：\n")

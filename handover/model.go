@@ -107,6 +107,32 @@ type Shift struct {
 	CreatedAt time.Time  `json:"created_at"`
 	Closed    bool       `json:"closed"`
 	ClosedAt  *time.Time `json:"closed_at,omitempty"`
+	// CloseSnapshot 是班次成功结束那一刻留下的事项记录；班次进行中为 nil。
+	// 旧版本数据中已结束但缺少结束记录的班次该字段也为 nil，查询时须明确标注
+	// “历史记录不完整”，不能把事项当前值宣称为结束时事实。
+	CloseSnapshot *ShiftCloseRecord `json:"close_snapshot,omitempty"`
+}
+
+// ShiftItemRecord 是某班次结束成功时为单个事项留下的不可变记录。
+// 字段值只反映结束那一刻，后续班次对事项的修改、继续跟踪或关闭都不会回写。
+type ShiftItemRecord struct {
+	ID            string     `json:"id"`
+	OriginShiftID string     `json:"origin_shift_id"`
+	Content       string     `json:"content"`
+	Severity      Severity   `json:"severity"`
+	Constraints   string     `json:"constraints,omitempty"`
+	FollowOwner   string     `json:"follow_owner"`
+	Closed        bool       `json:"closed"`
+	ClosedAt      *time.Time `json:"closed_at,omitempty"`
+	CloseOperator string     `json:"close_operator,omitempty"`
+}
+
+// ShiftCloseRecord 是班次结束时的事项清单快照。
+// 包含该班新增及已接收的全部事项（含结束前已关闭项），按事项编号排列且每项一次。
+// Items 非 nil 但长度为 0 表示结束时确实没有事项，与“缺少结束记录”相区别。
+type ShiftCloseRecord struct {
+	ClosedAt time.Time         `json:"closed_at"`
+	Items    []ShiftItemRecord `json:"items"`
 }
 
 // ItemEvent 是事项的追加式历史事件。
@@ -205,9 +231,18 @@ type EntryView struct {
 type ShiftReport struct {
 	Shift        Shift
 	OverlapNotes []OverlapNote
-	Items        []Item
-	Outgoing     *Handover
-	Incoming     []Handover
+	// OpenItems 是进行中班次当前清单上的事项（该班新增与已接收、尚未流转走）。
+	OpenItems []Item
+	// CloseItems 是已结束班次成功结束时留下的不可变记录；与 LatestItems 一一对照。
+	CloseItems []ShiftItemRecord
+	// LatestItems 是与该班相关事项的最新信息（当前所在班次、最新负责人、最新关闭情况），
+	// 只在有结束时记录时与 CloseItems 并列展示，明确区别于结束时事实。
+	LatestItems []Item
+	// LegacyItems 用于旧文件中已结束但缺少结束时记录的班次：仅为当前信息，
+	// 渲染时必须标注“历史记录不完整”。
+	LegacyItems []Item
+	Outgoing    *Handover
+	Incoming    []Handover
 	// Results 按事项编号汇总它在历次交接中的当前结果与退回历史。
 	Results map[string][]EntryView
 }

@@ -365,6 +365,31 @@ func (svc *Service) CloseShift(shiftID string) (Shift, error) {
 		now := svc.now()
 		sh.Closed = true
 		sh.ClosedAt = &now
+
+		// 留下结束时记录：该班新增与已接收的事项（含结束前已关闭项），
+		// 只反映结束那一刻，之后任何班次的修改、继续跟踪或关闭都不改写它。
+		// 空清单也要留下非 nil 的空切片，与“缺少历史记录”相区别。
+		records := []ShiftItemRecord{}
+		for i := range d.Items {
+			it := &d.Items[i]
+			if it.CurrentShiftID != sh.ID {
+				continue
+			}
+			records = append(records, ShiftItemRecord{
+				ID:            it.ID,
+				OriginShiftID: it.OriginShiftID,
+				Content:       it.Content,
+				Severity:      it.Severity,
+				Constraints:   it.Constraints,
+				FollowOwner:   it.FollowOwner,
+				Closed:        it.Closed,
+				ClosedAt:      it.ClosedAt,
+				CloseOperator: it.CloseOperator,
+			})
+		}
+		sort.Slice(records, func(i, j int) bool { return records[i].ID < records[j].ID })
+		sh.CloseSnapshot = &ShiftCloseRecord{ClosedAt: now, Items: records}
+
 		result = *sh
 		return nil
 	})
@@ -681,12 +706,36 @@ func (svc *Service) ShiftReport(shiftID string) (ShiftReport, error) {
 	}
 	sort.Slice(rep.OverlapNotes, func(i, j int) bool { return rep.OverlapNotes[i].ID < rep.OverlapNotes[j].ID })
 
+	// 与该班有关的事项：该班新增或曾经接收（含已流转到后续班次）的事项，每项一次。
+	related := []Item{}
 	for _, it := range d.Items {
-		if it.OriginShiftID == sh.ID || it.CurrentShiftID == sh.ID || contains(it.ShiftIDs, sh.ID) {
-			rep.Items = append(rep.Items, it)
+		if it.OriginShiftID == sh.ID || contains(it.ShiftIDs, sh.ID) {
+			related = append(related, it)
 		}
 	}
-	sort.Slice(rep.Items, func(i, j int) bool { return rep.Items[i].ID < rep.Items[j].ID })
+	sort.Slice(related, func(i, j int) bool { return related[i].ID < related[j].ID })
+
+	if sh.Closed {
+		// 已结束班次：结束时记录来自成功结束那一刻的快照，不随后续操作变化。
+		if sh.CloseSnapshot != nil {
+			// 保留非 nil 空切片，使“结束时没有事项”区别于缺少历史记录。
+			rep.CloseItems = make([]ShiftItemRecord, len(sh.CloseSnapshot.Items))
+			copy(rep.CloseItems, sh.CloseSnapshot.Items)
+			// 另外展示最新信息，与结束时记录明确区分。
+			rep.LatestItems = related
+		} else {
+			// 旧文件中缺少结束时记录的班次：只能展示当前信息，由渲染层标注
+			// “历史记录不完整”，不能把当前值宣称为结束时事实。
+			rep.LegacyItems = related
+		}
+	} else {
+		// 进行中班次展示当前信息：该班新增与已接收、尚未流转走的事项。
+		for _, it := range related {
+			if it.CurrentShiftID == sh.ID {
+				rep.OpenItems = append(rep.OpenItems, it)
+			}
+		}
+	}
 
 	for i := range d.Handovers {
 		h := &d.Handovers[i]
