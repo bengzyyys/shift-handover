@@ -536,6 +536,12 @@ func (svc *Service) ProcessEntry(handoverID, itemID string, action EntryAction, 
 			return fmt.Errorf("%w：事项 %s 已%s，不能重复处理或退回",
 				ErrHandoverState, e.ItemID, e.Status.Label())
 		}
+		if e.Status == EntryReturned {
+			// 退回表示等待交班人补充说明：只有交班人在同一交接记录上重新提交后，
+			// 该项才能再次接受处理。即使本次填了操作人、退回原因或跟踪说明也不能跳过。
+			return fmt.Errorf("%w：事项 %s 已退回，须由交班人补充说明并重新提交后才能继续处理",
+				ErrHandoverState, e.ItemID)
+		}
 		switch action {
 		case ActionReturn:
 			if err := requireNonEmpty("退回原因", reason); err != nil {
@@ -645,7 +651,18 @@ func (svc *Service) ResubmitReturned(handoverID, itemID, operator, supplement st
 		round.SupplementOperator = operator
 		round.SupplementAt = &now
 		round.ResubmittedAt = &now
+		// 重新提交只把这一项恢复为待处理：当前接班处理人与处理时间清空，
+		// 显示为尚未处理；退回时的操作人与处理时间仍保留在本轮退回历史中。
+		// 重新提交不表示接收，事项仍留在交班班次，原文、严重程度与限制条件不变。
 		e.Status = EntryPending
+		e.Operator = ""
+		e.ProcessedAt = nil
+		if it, _ := findItem(d, e.ItemID); it != nil {
+			it.Events = append(it.Events, ItemEvent{
+				At: now, Kind: "resubmitted", Operator: operator,
+				Detail: "交班人补充说明并重新提交：" + supplement,
+			})
+		}
 		result = *h
 		return nil
 	})
