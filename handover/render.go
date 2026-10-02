@@ -65,6 +65,30 @@ func dashIfEmpty(s string) string {
 	return s
 }
 
+// FormatCloseItem 格式化班次结束时冻结的事项记录，并与最新状态对照。
+func FormatCloseItem(snap CloseItemSnapshot, latest *Item) string {
+	var b strings.Builder
+	state := "结束时未关闭"
+	if snap.Closed {
+		state = fmt.Sprintf("结束时已关闭（%s 于 %s）", snap.CloseOperator, fmtTimePtr(snap.ClosedAt))
+	}
+	fmt.Fprintf(&b, "%s  严重程度=%s  %s\n", snap.ItemID, snap.Severity.Label(), state)
+	fmt.Fprintf(&b, "  内容：%s\n", snap.Content)
+	fmt.Fprintf(&b, "  限制条件：%s\n", dashIfEmpty(snap.Constraints))
+	fmt.Fprintf(&b, "  结束时后续负责人：%s\n", snap.FollowOwner)
+	if latest == nil {
+		b.WriteString("  最新状态：事项记录已不存在\n")
+		return b.String()
+	}
+	closeState := "未关闭"
+	if latest.Closed {
+		closeState = fmt.Sprintf("已关闭（%s 于 %s）", latest.CloseOperator, fmtTimePtr(latest.ClosedAt))
+	}
+	fmt.Fprintf(&b, "  最新状态：当前所在班次=%s  最新负责人=%s  最新关闭情况=%s\n",
+		latest.CurrentShiftID, latest.FollowOwner, closeState)
+	return b.String()
+}
+
 // FormatOverlapNote 格式化重叠说明。
 func FormatOverlapNote(n OverlapNote) string {
 	return fmt.Sprintf("%s  岗位=%s  班次 %s <-> %s  %s\n  说明：%s",
@@ -132,12 +156,30 @@ func FormatReport(rep ShiftReport) string {
 		b.WriteString(indentLines(FormatOverlapNote(n), "  "))
 	}
 
-	b.WriteString("\n事项：\n")
-	if len(rep.Items) == 0 {
-		b.WriteString("  （无）\n")
-	}
-	for _, it := range rep.Items {
-		b.WriteString(indentLines(FormatItem(it), "  "))
+	if rep.ItemsAtClose {
+		b.WriteString("\n事项（以下为结束时记录，冻结于该班结束成功时刻；后班的修改、关闭与交接不改变本记录）：\n")
+		if len(rep.CloseItems) == 0 {
+			b.WriteString("  （结束时没有事项）\n")
+		}
+		for _, s := range rep.CloseItems {
+			var latest *Item
+			if v, ok := rep.LatestItems[s.ItemID]; ok {
+				latest = &v
+			}
+			b.WriteString(indentLines(FormatCloseItem(s, latest), "  "))
+		}
+	} else {
+		if rep.HistoryIncomplete {
+			b.WriteString("\n事项（历史记录不完整，该班结束时未留下记录，以下为当前信息，不能视为结束时事实）：\n")
+		} else {
+			b.WriteString("\n事项：\n")
+		}
+		if len(rep.Items) == 0 {
+			b.WriteString("  （无）\n")
+		}
+		for _, it := range rep.Items {
+			b.WriteString(indentLines(FormatItem(it), "  "))
+		}
 	}
 
 	b.WriteString("\n交班对象：\n")

@@ -89,6 +89,24 @@ func findNote(d *Data, a, b string) *OverlapNote {
 	return nil
 }
 
+// currentItemsOfShift 返回与某班次相关的当前事项，按编号排列、每项只列一次。
+// 用于进行中班次的当前信息展示，以及缺少结束时记录的旧数据班次。
+func currentItemsOfShift(d *Data, shiftID string) []Item {
+	out := []Item{}
+	seen := map[string]bool{}
+	for _, it := range d.Items {
+		if seen[it.ID] {
+			continue
+		}
+		if it.OriginShiftID == shiftID || it.CurrentShiftID == shiftID || contains(it.ShiftIDs, shiftID) {
+			seen[it.ID] = true
+			out = append(out, it)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
+	return out
+}
+
 func hasNote(d *Data, a, b string) bool { return findNote(d, a, b) != nil }
 
 // CreateShift 建立班次。岗位、负责人必填，结束时间必须晚于开始时间。
@@ -344,6 +362,8 @@ func (svc *Service) CloseItem(itemID, operator string) (Item, error) {
 }
 
 // CloseShift 结束班次。接班交接仍有待处理或退回项时不允许结束；空清单也可以结束。
+// 结束成功时把在班事项（本班新增与已接收，含结束前已关闭者）冻结为结束时记录；
+// 校验或保存失败时不留下任何记录，班次保持进行中。
 func (svc *Service) CloseShift(shiftID string) (Shift, error) {
 	shiftID = clean(shiftID)
 	var result Shift
@@ -365,6 +385,29 @@ func (svc *Service) CloseShift(shiftID string) (Shift, error) {
 		now := svc.now()
 		sh.Closed = true
 		sh.ClosedAt = &now
+
+		// 冻结结束时在班的全部事项。退回或未确认的交接事项当前班次仍在交班
+		// 班次，不会被快照；结束前已关闭的事项保留关闭人与关闭时间。
+		record := &ShiftCloseRecord{Items: []CloseItemSnapshot{}}
+		for i := range d.Items {
+			it := &d.Items[i]
+			if it.CurrentShiftID != sh.ID {
+				continue
+			}
+			record.Items = append(record.Items, CloseItemSnapshot{
+				ItemID:        it.ID,
+				Content:       it.Content,
+				Severity:      it.Severity,
+				Constraints:   it.Constraints,
+				FollowOwner:   it.FollowOwner,
+				Closed:        it.Closed,
+				ClosedAt:      it.ClosedAt,
+				CloseOperator: it.CloseOperator,
+			})
+		}
+		sort.Slice(record.Items, func(i, j int) bool { return record.Items[i].ItemID < record.Items[j].ItemID })
+		sh.CloseRecord = record
+
 		result = *sh
 		return nil
 	})
@@ -664,10 +707,12 @@ func (svc *Service) OverlapNotes(shiftID string) []OverlapNote {
 }
 
 // ShiftReport 按班次汇总完整事项、关闭情况、接班对象、每项交接当前结果与历次退回/补充说明。
+// 进行中的班次展示当前事项；已结束班次展示结束时冻结的事项记录，
+// 旧数据中缺少结束时记录的班次只展示当前事项并标明历史不完整。
 func (svc *Service) ShiftReport(shiftID string) (ShiftReport, error) {
 	shiftID = clean(shiftID)
 	d := &svc.store.data
-	rep := ShiftReport{Results: map[string][]EntryView{}}
+	rep := ShiftReport{Results: map[string][]EntryView{}, LatestItems: map[string]Item{}}
 	sh, _ := findShift(d, shiftID)
 	if sh == nil {
 		return ShiftReport{}, fmt.Errorf("%w：班次 %s", ErrNotFound, shiftID)
@@ -681,10 +726,24 @@ func (svc *Service) ShiftReport(shiftID string) (ShiftReport, error) {
 	}
 	sort.Slice(rep.OverlapNotes, func(i, j int) bool { return rep.OverlapNotes[i].ID < rep.OverlapNotes[j].ID })
 
-	for _, it := range d.Items {
-		if it.OriginShiftID == sh.ID || it.CurrentShiftID == sh.ID || contains(it.ShiftIDs, sh.ID) {
-			rep.Items = append(rep.Items, it)
+	switch {
+	case !sh.Closed:
+		// 进行中的班次：事项可继续修改、关闭，展示当前信息。
+		rep.Items = currentItemsOfShift(d, sh.ID)
+	case sh.CloseRecord != nil:
+		// 已结束且有结束时记录：展示冻结的结束时信息，并对照最新状态。
+		rep.ItemsAtClose = true
+		rep.CloseItems = append([]CloseItemSnapshot(nil), sh.CloseRecord.Items...)
+		sort.Slice(rep.CloseItems, func(i, j int) bool { return rep.CloseItems[i].ItemID < rep.CloseItems[j].ItemID })
+		for _, s := range rep.CloseItems {
+			if it, _ := findItem(d, s.ItemID); it != nil {
+				rep.LatestItems[s.ItemID] = *it
+			}
 		}
+	default:
+		// 旧数据：结束时未留下记录，只能展示当前信息，不能宣称是结束时事实。
+		rep.HistoryIncomplete = true
+		rep.Items = currentItemsOfShift(d, sh.ID)
 	}
 	sort.Slice(rep.Items, func(i, j int) bool { return rep.Items[i].ID < rep.Items[j].ID })
 

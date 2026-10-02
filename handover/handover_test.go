@@ -1,9 +1,12 @@
 package handover
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -192,22 +195,25 @@ func TestItemLifecycleAndClosedShiftImmutability(t *testing.T) {
 		t.Fatalf("已结束班次事项关闭状态不能修改，got %v", err)
 	}
 
-	// 已关闭事项仍保留在查询结果中。
+	// 已关闭事项仍保留在结束时记录中。
 	rep, err := f.svc.ShiftReport(a.ID)
 	if err != nil {
 		t.Fatalf("report: %v", err)
 	}
-	if len(rep.Items) != 2 {
-		t.Fatalf("已关闭事项也应保留，期望2项，got %d", len(rep.Items))
+	if !rep.ItemsAtClose {
+		t.Fatalf("已结束班次应展示结束时记录")
+	}
+	if len(rep.CloseItems) != 2 {
+		t.Fatalf("已关闭事项也应保留在结束时记录中，期望2项，got %d", len(rep.CloseItems))
 	}
 	foundClosed := false
-	for _, x := range rep.Items {
-		if x.ID == it.ID && x.Closed {
+	for _, x := range rep.CloseItems {
+		if x.ItemID == it.ID && x.Closed {
 			foundClosed = true
 		}
 	}
 	if !foundClosed {
-		t.Fatalf("查询应展示关闭情况")
+		t.Fatalf("结束时记录应展示关闭情况")
 	}
 }
 
@@ -659,5 +665,453 @@ func TestParseHelpers(t *testing.T) {
 	}
 	if fmt.Sprint(SeverityUrgent.Label()) != "紧急" {
 		t.Fatalf("label")
+	}
+}
+
+// findCloseItem 在结束时记录中查找指定事项的快照。
+func findCloseItem(rep ShiftReport, itemID string) *CloseItemSnapshot {
+	for i := range rep.CloseItems {
+		if rep.CloseItems[i].ItemID == itemID {
+			return &rep.CloseItems[i]
+		}
+	}
+	return nil
+}
+
+// TestClosedShiftRecordFreezesItems：事项被后一班接收后，后续修改内容、调整
+// 负责人或关闭，都不改变已结束班次报告里的结束时记录；结束前已关闭的事项
+// 保留关闭人与关闭时间；item-show 仍展示最新状态。
+func TestClosedShiftRecordFreezesItems(t *testing.T) {
+	f := newFixture(t)
+	a := mustShift(t, f, "调度", "张三", tsDay(2, 8, 0), tsDay(2, 16, 0), "")
+	it, err := f.svc.AddItem(a.ID, "原始内容", SeverityImportant, "原限制", "原负责人")
+	if err != nil {
+		t.Fatalf("add: %v", err)
+	}
+	it2, err := f.svc.AddItem(a.ID, "第二项", SeverityNormal, "", "李四")
+	if err != nil {
+		t.Fatalf("add: %v", err)
+	}
+	if _, err := f.svc.CloseItem(it2.ID, "钱七"); err != nil {
+		t.Fatalf("close before shift end: %v", err)
+	}
+	if _, err := f.svc.CloseShift(a.ID); err != nil {
+		t.Fatalf("close shift: %v", err)
+	}
+
+	b := mustShift(t, f, "调度", "李四", tsDay(2, 16, 0), tsDay(2, 23, 0), "")
+	h, err := f.svc.CreateHandover(a.ID, b.ID)
+	if err != nil {
+		t.Fatalf("handover: %v", err)
+	}
+	if _, err := f.svc.ProcessEntry(h.ID, it.ID, ActionConfirm, "李四", "", "", ""); err != nil {
+		t.Fatalf("confirm: %v", err)
+	}
+	// 接班后修改内容、严重程度、限制条件、负责人，然后关闭。
+	if _, err := f.svc.UpdateItem(it.ID, "接班改后内容", SeverityUrgent, "新限制", "新负责人"); err != nil {
+		t.Fatalf("update after receive: %v", err)
+	}
+	if _, err := f.svc.CloseItem(it.ID, "李四"); err != nil {
+		t.Fatalf("close after receive: %v", err)
+	}
+
+	ra, err := f.svc.ShiftReport(a.ID)
+	if err != nil {
+		t.Fatalf("report a: %v", err)
+	}
+	if !ra.ItemsAtClose {
+		t.Fatalf("已结束班次应展示结束时记录")
+	}
+	if len(ra.CloseItems) != 2 {
+		t.Fatalf("结束时清单应含2项（含结束前已关闭的），got %d", len(ra.CloseItems))
+	}
+	snap := findCloseItem(ra, it.ID)
+	if snap == nil {
+		t.Fatalf("结束时记录缺少事项 %s", it.ID)
+	}
+	if snap.Content != "原始内容" || snap.Severity != SeverityImportant ||
+		snap.Constraints != "原限制" || snap.FollowOwner != "原负责人" {
+		t.Fatalf("结束时记录不得被后班修改改变：%+v", snap)
+	}
+	if snap.Closed {
+		t.Fatalf("结束时未关闭的事项不能因后班关闭而显示成当时已关闭")
+	}
+	snap2 := findCloseItem(ra, it2.ID)
+	if snap2 == nil || !snap2.Closed || snap2.CloseOperator != "钱七" || snap2.ClosedAt == nil {
+		t.Fatalf("结束前已关闭事项应保留关闭人与关闭时间：%+v", snap2)
+	}
+	latest := ra.LatestItems[it.ID]
+	if latest.CurrentShiftID != b.ID || latest.FollowOwner != "新负责人" || !latest.Closed {
+		t.Fatalf("最新状态应与结束时信息明确区分：%+v", latest)
+	}
+
+	// item-show 继续展示事项最新状态。
+	cur, err := f.svc.GetItem(it.ID)
+	if err != nil {
+		t.Fatalf("get item: %v", err)
+	}
+	if cur.Content != "接班改后内容" || cur.Severity != SeverityUrgent ||
+		cur.Constraints != "新限制" || cur.FollowOwner != "新负责人" || !cur.Closed {
+		t.Fatalf("item-show 应展示最新状态：%+v", cur)
+	}
+
+	// 渲染文本应标明“结束时记录”并区分“最新状态”。
+	text := handoverReportText(t, f.svc, a.ID)
+	if !strings.Contains(text, "结束时记录") {
+		t.Fatalf("报告应标明结束时记录")
+	}
+	if !strings.Contains(text, "最新状态") {
+		t.Fatalf("报告应展示最新状态对照")
+	}
+}
+
+// handoverReportText 生成班次报告文本。
+func handoverReportText(t *testing.T, svc *Service, shiftID string) string {
+	t.Helper()
+	rep, err := svc.ShiftReport(shiftID)
+	if err != nil {
+		t.Fatalf("report: %v", err)
+	}
+	return FormatReport(rep)
+}
+
+// TestChainedShiftsEachKeepOwnRecord：同一事项连续经过几个班次，编号与原始
+// 班次不变，各班分别保留自己的结束时记录。
+func TestChainedShiftsEachKeepOwnRecord(t *testing.T) {
+	f := newFixture(t)
+	a := mustShift(t, f, "调度", "张三", tsDay(2, 8, 0), tsDay(2, 16, 0), "")
+	it, err := f.svc.AddItem(a.ID, "事项", SeverityNormal, "甲留下的限制", "甲负责人")
+	if err != nil {
+		t.Fatalf("add: %v", err)
+	}
+	if _, err := f.svc.CloseShift(a.ID); err != nil {
+		t.Fatalf("close a: %v", err)
+	}
+
+	b := mustShift(t, f, "调度", "李四", tsDay(2, 16, 0), tsDay(2, 23, 0), "")
+	h1, err := f.svc.CreateHandover(a.ID, b.ID)
+	if err != nil {
+		t.Fatalf("handover a->b: %v", err)
+	}
+	if _, err := f.svc.ProcessEntry(h1.ID, it.ID, ActionConfirm, "李四", "", "", ""); err != nil {
+		t.Fatalf("confirm: %v", err)
+	}
+	// 接班修改限制，再结束。
+	if _, err := f.svc.UpdateItem(it.ID, "事项", SeverityImportant, "乙修改的限制", "甲负责人"); err != nil {
+		t.Fatalf("update: %v", err)
+	}
+	if _, err := f.svc.CloseShift(b.ID); err != nil {
+		t.Fatalf("close b: %v", err)
+	}
+
+	c := mustShift(t, f, "调度", "赵六", tsDay(2, 23, 0), tsDay(3, 7, 0), "")
+	h2, err := f.svc.CreateHandover(b.ID, c.ID)
+	if err != nil {
+		t.Fatalf("handover b->c: %v", err)
+	}
+	if _, err := f.svc.ProcessEntry(h2.ID, it.ID, ActionConfirm, "赵六", "", "", ""); err != nil {
+		t.Fatalf("confirm c: %v", err)
+	}
+	if _, err := f.svc.CloseItem(it.ID, "赵六"); err != nil {
+		t.Fatalf("close in c: %v", err)
+	}
+	if _, err := f.svc.CloseShift(c.ID); err != nil {
+		t.Fatalf("close c: %v", err)
+	}
+
+	ra, _ := f.svc.ShiftReport(a.ID)
+	rb, _ := f.svc.ShiftReport(b.ID)
+	rc, _ := f.svc.ShiftReport(c.ID)
+	sa, sb, sc := findCloseItem(ra, it.ID), findCloseItem(rb, it.ID), findCloseItem(rc, it.ID)
+	if sa == nil || sb == nil || sc == nil {
+		t.Fatalf("三个班次都应保留结束时记录")
+	}
+	if sa.Constraints != "甲留下的限制" || sa.Severity != SeverityNormal || sa.Closed {
+		t.Fatalf("甲班记录应为自己结束时的限制且未关闭：%+v", sa)
+	}
+	if sb.Constraints != "乙修改的限制" || sb.Severity != SeverityImportant || sb.Closed {
+		t.Fatalf("乙班记录应为自己结束时的限制且未关闭：%+v", sb)
+	}
+	if !sc.Closed || sc.CloseOperator != "赵六" {
+		t.Fatalf("丙班记录应为已关闭：%+v", sc)
+	}
+
+	// 编号与原始班次保持不变。
+	cur, _ := f.svc.GetItem(it.ID)
+	if cur.ID != it.ID || cur.OriginShiftID != a.ID {
+		t.Fatalf("编号与原始班次应保持不变：%+v", cur)
+	}
+
+	// 进行中的班次仍展示当前信息。
+	d := mustShift(t, f, "调度", "孙八", tsDay(3, 7, 0), tsDay(3, 15, 0), "")
+	rep, err := f.svc.ShiftReport(d.ID)
+	if err != nil {
+		t.Fatalf("report open shift: %v", err)
+	}
+	if rep.ItemsAtClose || rep.HistoryIncomplete {
+		t.Fatalf("进行中的班次不应有结束时记录标记")
+	}
+}
+
+// TestEmptyCloseRecordMarked：空清单成功结束后明确显示当时没有事项，
+// 与缺少历史记录区分开。
+func TestEmptyCloseRecordMarked(t *testing.T) {
+	f := newFixture(t)
+	e := mustShift(t, f, "调度", "孙八", tsDay(3, 0, 0), tsDay(3, 8, 0), "")
+	if _, err := f.svc.CloseShift(e.ID); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+	rep, err := f.svc.ShiftReport(e.ID)
+	if err != nil {
+		t.Fatalf("report: %v", err)
+	}
+	if !rep.ItemsAtClose {
+		t.Fatalf("空清单结束也应留下结束时记录")
+	}
+	if len(rep.CloseItems) != 0 {
+		t.Fatalf("结束时记录应为空清单，got %d", len(rep.CloseItems))
+	}
+	text := handoverReportText(t, f.svc, e.ID)
+	if !strings.Contains(text, "结束时没有事项") {
+		t.Fatalf("空清单结束应明确显示当时没有事项：\n%s", text)
+	}
+	if strings.Contains(text, "历史记录不完整") {
+		t.Fatalf("空清单记录不应被标记为历史不完整")
+	}
+}
+
+// TestLegacyDataWithoutCloseRecord：旧文件中缺少结束时记录的已结束班次，
+// 事项区标明“历史记录不完整，以下为当前信息”；旧的进行中班次成功结束后
+// 留下完整记录。
+func TestLegacyDataWithoutCloseRecord(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "data.json")
+	closedAt := tsDay(2, 16, 0)
+	createdAt := tsDay(2, 8, 0)
+	data := Data{
+		ShiftSeq: 2,
+		ItemSeq:  1,
+		Shifts: []Shift{
+			{ID: "S001", Position: "调度", Owner: "张三", Start: tsDay(2, 8, 0), End: tsDay(2, 16, 0),
+				CreatedAt: createdAt, Closed: true, ClosedAt: &closedAt},
+			{ID: "S002", Position: "调度", Owner: "李四", Start: tsDay(2, 16, 0), End: tsDay(2, 23, 0),
+				CreatedAt: closedAt},
+		},
+		Items: []Item{{
+			ID: "I001", OriginShiftID: "S001", ShiftIDs: []string{"S001"}, CurrentShiftID: "S001",
+			Content: "旧内容", Severity: SeverityNormal, FollowOwner: "王五", CreatedAt: createdAt,
+		}},
+	}
+	raw, err := json.Marshal(data)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if err := os.WriteFile(path, raw, 0o644); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+
+	store, err := Open(path)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	svc := NewService(store)
+
+	rep, err := svc.ShiftReport("S001")
+	if err != nil {
+		t.Fatalf("report: %v", err)
+	}
+	if !rep.HistoryIncomplete || rep.ItemsAtClose {
+		t.Fatalf("旧数据应标记历史记录不完整，got %+v", rep)
+	}
+	if len(rep.Items) != 1 || rep.Items[0].Content != "旧内容" {
+		t.Fatalf("旧数据应展示当前事项信息：%+v", rep.Items)
+	}
+	text := handoverReportText(t, svc, "S001")
+	if !strings.Contains(text, "历史记录不完整") || !strings.Contains(text, "当前信息") {
+		t.Fatalf("旧数据报告应标明历史记录不完整、以下为当前信息：\n%s", text)
+	}
+
+	// 旧的进行中班次成功结束后也要留下完整记录。
+	if _, err := svc.CloseShift("S002"); err != nil {
+		t.Fatalf("close legacy open shift: %v", err)
+	}
+	rep2, err := svc.ShiftReport("S002")
+	if err != nil {
+		t.Fatalf("report after close: %v", err)
+	}
+	if !rep2.ItemsAtClose || rep2.HistoryIncomplete {
+		t.Fatalf("旧进行中班次结束后应留下完整结束时记录")
+	}
+}
+
+// TestFailedCloseLeavesNoRecord：结束班次因接班交接未完成而失败时，班次仍
+// 保持进行中，不留下结束时记录；重试成功后以那次成功时的事项为准；
+// 再次结束已结束班次报错，不能重写历史。
+func TestFailedCloseLeavesNoRecord(t *testing.T) {
+	f := newFixture(t)
+	a := mustShift(t, f, "调度", "张三", tsDay(2, 8, 0), tsDay(2, 16, 0), "")
+	if _, err := f.svc.AddItem(a.ID, "事项", SeverityNormal, "", "李四"); err != nil {
+		t.Fatalf("add: %v", err)
+	}
+	if _, err := f.svc.CloseShift(a.ID); err != nil {
+		t.Fatalf("close a: %v", err)
+	}
+	b := mustShift(t, f, "调度", "李四", tsDay(2, 16, 0), tsDay(2, 23, 0), "")
+	h, err := f.svc.CreateHandover(a.ID, b.ID)
+	if err != nil {
+		t.Fatalf("handover: %v", err)
+	}
+
+	// 接班交接未完成，结束失败。
+	if _, err := f.svc.CloseShift(b.ID); !errors.Is(err, ErrHandoverState) {
+		t.Fatalf("有未处理交接项时结束应报错，got %v", err)
+	}
+	rep, err := f.svc.ShiftReport(b.ID)
+	if err != nil {
+		t.Fatalf("report: %v", err)
+	}
+	if rep.Shift.Closed || rep.ItemsAtClose {
+		t.Fatalf("结束失败不应留下结束时记录")
+	}
+
+	// 处理交接；接收后修改内容，使重试成功时的事项与失败时不同。
+	if _, err := f.svc.ProcessEntry(h.ID, "I001", ActionConfirm, "李四", "", "", ""); err != nil {
+		t.Fatalf("confirm: %v", err)
+	}
+	if _, err := f.svc.UpdateItem("I001", "重试时内容", SeverityUrgent, "限制", "王五"); err != nil {
+		t.Fatalf("update: %v", err)
+	}
+	if _, err := f.svc.CloseShift(b.ID); err != nil {
+		t.Fatalf("retry close: %v", err)
+	}
+	rep2, err := f.svc.ShiftReport(b.ID)
+	if err != nil {
+		t.Fatalf("report after retry: %v", err)
+	}
+	if !rep2.ItemsAtClose {
+		t.Fatalf("重试成功后应有结束时记录")
+	}
+	snap := findCloseItem(rep2, "I001")
+	if snap == nil || snap.Content != "重试时内容" || snap.Severity != SeverityUrgent {
+		t.Fatalf("重试成功应以那次成功时的事项为准：%+v", snap)
+	}
+
+	// 再次结束已结束班次报错，不能重写历史。
+	if _, err := f.svc.CloseShift(b.ID); !errors.Is(err, ErrShiftClosed) {
+		t.Fatalf("重复结束应报错，got %v", err)
+	}
+}
+
+// TestTrackNewOwnerKeepsHandoverShiftOwner：继续跟踪指定新负责人时，交接
+// 处理结果与事项最新信息反映新负责人，交班班次结束时留下的负责人仍可辨认。
+func TestTrackNewOwnerKeepsHandoverShiftOwner(t *testing.T) {
+	f := newFixture(t)
+	a, b, items := prepareHandover(t, f)
+	h, err := f.svc.CreateHandover(a.ID, b.ID)
+	if err != nil {
+		t.Fatalf("handover: %v", err)
+	}
+	idA := items[0].ID
+	if _, err := f.svc.ProcessEntry(h.ID, idA, ActionTrack, "李四", "", "继续盯到底", "新负责人"); err != nil {
+		t.Fatalf("track: %v", err)
+	}
+
+	ra, err := f.svc.ShiftReport(a.ID)
+	if err != nil {
+		t.Fatalf("report a: %v", err)
+	}
+	snap := findCloseItem(ra, idA)
+	if snap == nil {
+		t.Fatalf("交班班次应有结束时记录")
+	}
+	if snap.FollowOwner != "李四" {
+		t.Fatalf("交班班次结束时留下的负责人仍可辨认，got %s", snap.FollowOwner)
+	}
+
+	cur, err := f.svc.GetItem(idA)
+	if err != nil {
+		t.Fatalf("get item: %v", err)
+	}
+	if cur.FollowOwner != "新负责人" {
+		t.Fatalf("事项最新信息应反映新负责人，got %s", cur.FollowOwner)
+	}
+	got, err := f.svc.GetHandover(h.ID)
+	if err != nil {
+		t.Fatalf("get handover: %v", err)
+	}
+	for _, e := range got.Entries {
+		if e.ItemID == idA && e.FollowOwner != "新负责人" {
+			t.Fatalf("交接处理结果应反映新负责人，got %s", e.FollowOwner)
+		}
+	}
+}
+
+// TestCloseRecordPersistsAcrossReopen：退出再打开后，结束时记录、最新事项
+// 信息与交接进度都应保留。
+func TestCloseRecordPersistsAcrossReopen(t *testing.T) {
+	f := newFixture(t)
+	a := mustShift(t, f, "调度", "张三", tsDay(2, 8, 0), tsDay(2, 16, 0), "")
+	if _, err := f.svc.AddItem(a.ID, "事项", SeverityNormal, "限制", "李四"); err != nil {
+		t.Fatalf("add: %v", err)
+	}
+	if _, err := f.svc.CloseShift(a.ID); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+	b := mustShift(t, f, "调度", "李四", tsDay(2, 16, 0), tsDay(2, 23, 0), "")
+	h, err := f.svc.CreateHandover(a.ID, b.ID)
+	if err != nil {
+		t.Fatalf("handover: %v", err)
+	}
+	if _, err := f.svc.ProcessEntry(h.ID, "I001", ActionReturn, "李四", "需补充", "", ""); err != nil {
+		t.Fatalf("return: %v", err)
+	}
+
+	f.reopen(t)
+
+	rep, err := f.svc.ShiftReport(a.ID)
+	if err != nil {
+		t.Fatalf("report: %v", err)
+	}
+	if !rep.ItemsAtClose || len(rep.CloseItems) != 1 {
+		t.Fatalf("重开后结束时记录应保留")
+	}
+	snap := findCloseItem(rep, "I001")
+	if snap == nil || snap.Constraints != "限制" || snap.FollowOwner != "李四" || snap.Closed {
+		t.Fatalf("重开后结束时记录内容应保留：%+v", snap)
+	}
+	// 交接进度仍在：退回项未完成。
+	got, err := f.svc.GetHandover(h.ID)
+	if err != nil {
+		t.Fatalf("get handover: %v", err)
+	}
+	if got.Completed() {
+		t.Fatalf("重开后交接进度应保留（退回项未完成）")
+	}
+}
+
+// TestOpenShiftReportListsItemsOnce：事项清单按编号排列，每项只列一次。
+func TestOpenShiftReportListsItemsOnce(t *testing.T) {
+	f := newFixture(t)
+	a := mustShift(t, f, "调度", "张三", tsDay(2, 8, 0), tsDay(2, 16, 0), "")
+	for _, c := range []string{"甲", "乙", "丙"} {
+		if _, err := f.svc.AddItem(a.ID, c, SeverityNormal, "", "李四"); err != nil {
+			t.Fatalf("add: %v", err)
+		}
+	}
+	rep, err := f.svc.ShiftReport(a.ID)
+	if err != nil {
+		t.Fatalf("report: %v", err)
+	}
+	seen := map[string]int{}
+	for _, it := range rep.Items {
+		seen[it.ID]++
+	}
+	for _, id := range []string{"I001", "I002", "I003"} {
+		if seen[id] != 1 {
+			t.Fatalf("事项 %s 应恰好出现一次，got %d", id, seen[id])
+		}
+	}
+	if rep.Items[0].ID != "I001" || rep.Items[1].ID != "I002" || rep.Items[2].ID != "I003" {
+		t.Fatalf("事项清单应按编号排列")
 	}
 }

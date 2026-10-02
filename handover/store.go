@@ -72,8 +72,17 @@ func (s *Store) commit() (err error) {
 }
 
 // mutate 在数据快照上执行业务变更；业务失败或写盘失败都回滚到快照。
+// 快照采用深拷贝：写盘失败时内存中的数据也必须恢复到变更前，
+// 避免出现“文件未写成、内存已改半套”的情况。
 func (s *Store) mutate(fn func(*Data) error) error {
-	snapshot := s.data
+	raw, err := json.Marshal(s.data)
+	if err != nil {
+		return err
+	}
+	var snapshot Data
+	if err := json.Unmarshal(raw, &snapshot); err != nil {
+		return err
+	}
 	if err := fn(&s.data); err != nil {
 		s.data = snapshot
 		return err
