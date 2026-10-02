@@ -31,16 +31,7 @@ func FormatShift(sh Shift) string {
 // FormatItem 格式化事项及其关闭情况与历史。
 func FormatItem(it Item) string {
 	var b strings.Builder
-	state := "未关闭"
-	if it.Closed {
-		state = fmt.Sprintf("已关闭（%s 于 %s）", it.CloseOperator, fmtTimePtr(it.ClosedAt))
-	}
-	fmt.Fprintf(&b, "%s  严重程度=%s  当前班次=%s  原始班次=%s  [%s]\n",
-		it.ID, it.Severity.Label(), it.CurrentShiftID, it.OriginShiftID, state)
-	fmt.Fprintf(&b, "  内容：%s\n", it.Content)
-	fmt.Fprintf(&b, "  限制条件：%s\n", dashIfEmpty(it.Constraints))
-	fmt.Fprintf(&b, "  后续负责人：%s\n", it.FollowOwner)
-	fmt.Fprintf(&b, "  流经班次：%s\n", strings.Join(it.ShiftIDs, " -> "))
+	writeItemHeader(&b, it)
 	if len(it.Events) > 0 {
 		b.WriteString("  历史：\n")
 		for _, ev := range it.Events {
@@ -58,11 +49,129 @@ func FormatItem(it Item) string {
 	return b.String()
 }
 
+// writeItemHeader 输出事项的最新内容、严重程度、限制条件、后续负责人、
+// 当前所在班次、关闭情况和流经班次。
+func writeItemHeader(b *strings.Builder, it Item) {
+	state := "未关闭"
+	if it.Closed {
+		state = fmt.Sprintf("已关闭（%s 于 %s）", it.CloseOperator, fmtTimePtr(it.ClosedAt))
+	}
+	fmt.Fprintf(b, "%s  严重程度=%s  当前班次=%s  原始班次=%s  [%s]\n",
+		it.ID, it.Severity.Label(), it.CurrentShiftID, it.OriginShiftID, state)
+	fmt.Fprintf(b, "  内容：%s\n", it.Content)
+	fmt.Fprintf(b, "  限制条件：%s\n", dashIfEmpty(it.Constraints))
+	fmt.Fprintf(b, "  后续负责人：%s\n", it.FollowOwner)
+	fmt.Fprintf(b, "  流经班次：%s\n", strings.Join(it.ShiftIDs, " -> "))
+}
+
 func dashIfEmpty(s string) string {
 	if s == "" {
 		return "-"
 	}
 	return s
+}
+
+// whoIfRecorded 展示操作人，未记录时明确标为未记录，不以其他人代替。
+func whoIfRecorded(s string) string {
+	if s == "" {
+		return "未记录"
+	}
+	return s
+}
+
+// fmtTimePtrIfRecorded 展示时间指针，缺失时明确标为未记录。
+func fmtTimePtrIfRecorded(t *time.Time) string {
+	if t == nil {
+		return "未记录"
+	}
+	return fmtTime(*t)
+}
+
+// entryCurrentResultLabel 是交接当前结果在事项处理经过查询中的展示名。
+func entryCurrentResultLabel(s EntryStatus) string {
+	switch s {
+	case EntryPending:
+		return "待处理（接班人尚未处理）"
+	case EntryReturned:
+		return "退回（等待交班人补充）"
+	case EntryConfirmed:
+		return "确认接收"
+	case EntryTracking:
+		return "继续跟踪（已接收）"
+	}
+	return string(s)
+}
+
+// FormatJourneyEvent 格式化处理经过中的单条记录。交接相关记录带有交接
+// 编号与交班、接班班次；缺少的人名或时间明确标为未记录，不推测补齐。
+func FormatJourneyEvent(ev JourneyEvent) string {
+	when := "未记录"
+	if ev.TimeKnown {
+		when = fmtTime(ev.At)
+	}
+	who := whoIfRecorded(ev.Operator)
+	where := ""
+	if ev.HandoverID != "" {
+		where = fmt.Sprintf("交接 %s（%s -> %s）", ev.HandoverID, ev.FromShift, ev.ToShift)
+	}
+	switch ev.Kind {
+	case "created":
+		return when + " 事项建立"
+	case "updated":
+		return fmt.Sprintf("%s 修改：%s", when, ev.Detail)
+	case "closed":
+		return fmt.Sprintf("%s 关闭 操作人=%s", when, who)
+	case "received":
+		return fmt.Sprintf("%s 接收 操作人=%s %s", when, who, ev.Detail)
+	case "handover-init":
+		// 交接发起不记录操作人，始终显示未记录，不以班次负责人代替。
+		return fmt.Sprintf("%s %s发起交接 操作人=%s", when, where, who)
+	case "return":
+		return fmt.Sprintf("%s %s第%d次退回 操作人=%s 原因=%s",
+			when, where, ev.RoundSeq, who, ev.Reason)
+	case "resubmit":
+		return fmt.Sprintf("%s %s第%d次重新提交 补充说明=%s 补充人=%s 补充时间=%s",
+			when, where, ev.RoundSeq, dashIfEmpty(ev.Supplement),
+			whoIfRecorded(ev.SupplementOperator), fmtTimePtrIfRecorded(ev.SupplementAt))
+	case "confirm":
+		return fmt.Sprintf("%s %s确认接收 操作人=%s", when, where, who)
+	case "track":
+		return fmt.Sprintf("%s %s继续跟踪 操作人=%s 跟踪说明=%s 后续负责人=%s",
+			when, where, who, dashIfEmpty(ev.TrackingNote), dashIfEmpty(ev.FollowOwner))
+	}
+	return when + " " + ev.Kind
+}
+
+// FormatItemJourney 格式化凭事项编号查询得到的完整处理经过：开头为事项
+// 最新状态，随后是合并事项自身历史与各次交接经过的时间线，最后列出该事项
+// 在每次交接中的当前处理结果；尚未参与交接的显示暂无交接记录。
+func FormatItemJourney(j ItemJourney) string {
+	var b strings.Builder
+	writeItemHeader(&b, j.Item)
+
+	b.WriteString("  处理经过：\n")
+	if len(j.Events) == 0 {
+		b.WriteString("    （暂无记录）\n")
+	}
+	for _, ev := range j.Events {
+		b.WriteString("    - " + FormatJourneyEvent(ev) + "\n")
+	}
+
+	b.WriteString("  交接当前结果：\n")
+	if !j.HasHandovers {
+		b.WriteString("    暂无交接记录\n")
+	}
+	for _, r := range j.Results {
+		operator, processedAt := "尚未处理", "尚未处理"
+		if r.Entry.ProcessedAt != nil {
+			operator = whoIfRecorded(r.Entry.Operator)
+			processedAt = fmtTime(*r.Entry.ProcessedAt)
+		}
+		fmt.Fprintf(&b, "    交接 %s（%s -> %s）当前结果：%s；处理人=%s；处理时间=%s\n",
+			r.HandoverID, r.FromShift, r.ToShift,
+			entryCurrentResultLabel(r.Entry.Status), operator, processedAt)
+	}
+	return b.String()
 }
 
 // FormatCloseItem 格式化班次结束时冻结的事项记录，并与最新状态对照。

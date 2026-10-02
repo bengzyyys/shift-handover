@@ -44,7 +44,7 @@ const usageText = `用法：handover [--data 文件] <命令> [参数]
                                  --severity normal|important|urgent \
                                  [--constraints 限制条件] --follow 后续负责人
   item-close     关闭事项        --id 事项编号 --operator 操作人
-  item-show      查询事项        --id 事项编号
+  item-show      查询事项        --id 事项编号（最新状态、完整处理经过与各次交接当前结果）
 
 交接：
   handover-create   发起交接      --from 交班班次 --to 接班班次
@@ -231,11 +231,11 @@ func dispatch(svc *handover.Service, cmd string, args []string) (string, error) 
 		return "已关闭事项\n" + handover.FormatItem(it), nil
 
 	case "item-show":
-		it, err := svc.GetItem(id)
+		j, err := svc.ItemJourney(id)
 		if err != nil {
 			return "", err
 		}
-		return handover.FormatItem(it), nil
+		return handover.FormatItemJourney(j), nil
 
 	case "handover-create":
 		h, err := svc.CreateHandover(from, to)

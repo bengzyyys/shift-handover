@@ -1490,3 +1490,369 @@ func TestReturnedStatePersistsAcrossReopen(t *testing.T) {
 		t.Fatalf("重开后续办完成应保留")
 	}
 }
+
+// journeyKinds 提取处理经过的事件类型序列，便于断言顺序。
+func journeyKinds(j ItemJourney) []string {
+	kinds := make([]string, len(j.Events))
+	for i, ev := range j.Events {
+		kinds[i] = ev.Kind
+	}
+	return kinds
+}
+
+func joinStrings(xs []string) string {
+	out := ""
+	for i, x := range xs {
+		if i > 0 {
+			out += ","
+		}
+		out += x
+	}
+	return out
+}
+
+// TestItemJourneyFullFlow：凭一个事项编号即可查看它从建立到当前、跨多个班次
+// 交接的完整处理经过，无须先知道交接编号；各次交接的当前结果一并列出。
+func TestItemJourneyFullFlow(t *testing.T) {
+	f := newFixture(t)
+	a := mustShift(t, f, "调度", "张三", tsDay(2, 8, 0), tsDay(2, 16, 0), "")
+	b := mustShift(t, f, "调度", "李四", tsDay(2, 16, 0), tsDay(2, 23, 0), "")
+	c := mustShift(t, f, "调度", "赵六", tsDay(2, 23, 0), tsDay(3, 7, 0), "")
+	it, err := f.svc.AddItem(a.ID, "泵房压力异常", SeverityImportant, "夜间禁动", "李四")
+	if err != nil {
+		t.Fatalf("add item: %v", err)
+	}
+	// 同一交接里的另一事项，不应出现在本事项经过中。
+	other, err := f.svc.AddItem(a.ID, "无关事项勿混入", SeverityNormal, "", "李四")
+	if err != nil {
+		t.Fatalf("add other: %v", err)
+	}
+	if _, err := f.svc.CloseShift(a.ID); err != nil {
+		t.Fatalf("close a: %v", err)
+	}
+
+	h1, err := f.svc.CreateHandover(a.ID, b.ID)
+	if err != nil {
+		t.Fatalf("create h1: %v", err)
+	}
+	if _, err := f.svc.ProcessEntry(h1.ID, it.ID, ActionReturn, "李四", "缺少现场照片", "", ""); err != nil {
+		t.Fatalf("return1: %v", err)
+	}
+	if _, err := f.svc.ResubmitReturned(h1.ID, it.ID, "张三", "照片已上传"); err != nil {
+		t.Fatalf("resubmit1: %v", err)
+	}
+	if _, err := f.svc.ProcessEntry(h1.ID, it.ID, ActionReturn, "李四", "照片不清晰", "", ""); err != nil {
+		t.Fatalf("return2: %v", err)
+	}
+	if _, err := f.svc.ResubmitReturned(h1.ID, it.ID, "张三", "已重新拍摄"); err != nil {
+		t.Fatalf("resubmit2: %v", err)
+	}
+	if _, err := f.svc.ProcessEntry(h1.ID, it.ID, ActionTrack, "李四", "", "每两小时记录压力", "王五"); err != nil {
+		t.Fatalf("track: %v", err)
+	}
+	if _, err := f.svc.ProcessEntry(h1.ID, other.ID, ActionConfirm, "李四", "", "", ""); err != nil {
+		t.Fatalf("confirm other: %v", err)
+	}
+	if _, err := f.svc.CloseShift(b.ID); err != nil {
+		t.Fatalf("close b: %v", err)
+	}
+	h2, err := f.svc.CreateHandover(b.ID, c.ID)
+	if err != nil {
+		t.Fatalf("create h2: %v", err)
+	}
+	if _, err := f.svc.ProcessEntry(h2.ID, it.ID, ActionConfirm, "赵六", "", "", ""); err != nil {
+		t.Fatalf("confirm h2: %v", err)
+	}
+	// 接收后再修改事项负责人，历史中的跟踪负责人不能跟着变。
+	if _, err := f.svc.UpdateItem(it.ID, "泵房压力异常", SeverityImportant, "夜间禁动", "钱七"); err != nil {
+		t.Fatalf("update: %v", err)
+	}
+
+	j, err := f.svc.ItemJourney(it.ID)
+	if err != nil {
+		t.Fatalf("journey: %v", err)
+	}
+	if !j.HasHandovers {
+		t.Fatalf("应识别出事项参与过交接")
+	}
+	want := []string{
+		"created",
+		"handover-init", "return", "resubmit", "return", "resubmit", "track",
+		"handover-init", "confirm",
+		"updated",
+	}
+	got := journeyKinds(j)
+	if joinStrings(got) != joinStrings(want) {
+		t.Fatalf("经过顺序不正确：want %v, got %v", want, got)
+	}
+	// 同一次接收只展示一次：事项历史里的 received 事件不应重复出现。
+	for _, ev := range j.Events {
+		if ev.Kind == "received" {
+			t.Fatalf("接收事件应与交接中的接收处理合并，只展示一次：%+v", ev)
+		}
+	}
+	// 时间从早到晚。
+	for i := 1; i < len(j.Events); i++ {
+		if j.Events[i].TimeKnown && j.Events[i-1].TimeKnown && j.Events[i].At.Before(j.Events[i-1].At) {
+			t.Fatalf("经过应按实际发生时刻排序：%v 早于 %v", j.Events[i].At, j.Events[i-1].At)
+		}
+	}
+	// 发起交接不记录操作人，明确为空（展示为未记录），不以班次负责人代替。
+	if j.Events[1].Operator != "" || j.Events[1].HandoverID != h1.ID {
+		t.Fatalf("发起交接不应有操作人：%+v", j.Events[1])
+	}
+	// 退回保留轮次与完整原因；重新提交保留补充说明与补充人。
+	if j.Events[2].RoundSeq != 1 || j.Events[2].Reason != "缺少现场照片" || j.Events[2].Operator != "李四" {
+		t.Fatalf("第1次退回记录不正确：%+v", j.Events[2])
+	}
+	if j.Events[3].Supplement != "照片已上传" || j.Events[3].SupplementOperator != "张三" {
+		t.Fatalf("第1次重新提交记录不正确：%+v", j.Events[3])
+	}
+	if j.Events[4].Reason != "照片不清晰" || j.Events[5].Supplement != "已重新拍摄" {
+		t.Fatalf("第2轮退回与补充不应覆盖第1轮：%+v %+v", j.Events[4], j.Events[5])
+	}
+	// 继续跟踪保留跟踪说明与当时的后续负责人，不随后续修改改变。
+	tr := j.Events[6]
+	if tr.TrackingNote != "每两小时记录压力" || tr.FollowOwner != "王五" {
+		t.Fatalf("跟踪说明与当时的跟踪负责人应保留：%+v", tr)
+	}
+	if j.Item.FollowOwner != "钱七" {
+		t.Fatalf("事项最新负责人应为修改后的值：%s", j.Item.FollowOwner)
+	}
+	// 每次交接的当前处理结果。
+	if len(j.Results) != 2 || j.Results[0].HandoverID != h1.ID || j.Results[1].HandoverID != h2.ID {
+		t.Fatalf("应列出两次交接的当前结果：%+v", j.Results)
+	}
+	if j.Results[0].Entry.Status != EntryTracking || j.Results[1].Entry.Status != EntryConfirmed {
+		t.Fatalf("各次交接当前结果不正确：%+v", j.Results)
+	}
+
+	text := FormatItemJourney(j)
+	for _, want := range []string{
+		"泵房压力异常", "重要", "夜间禁动", "钱七", "当前班次=" + c.ID,
+		"发起交接", "操作人=未记录",
+		"第1次退回", "缺少现场照片", "第1次重新提交", "照片已上传", "补充人=张三",
+		"第2次退回", "照片不清晰", "已重新拍摄",
+		"继续跟踪", "每两小时记录压力", "后续负责人=王五",
+		"确认接收", "交接当前结果", h1.ID, h2.ID, a.ID + " -> " + b.ID, b.ID + " -> " + c.ID,
+	} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("展示缺少 %q：\n%s", want, text)
+		}
+	}
+	if strings.Contains(text, other.ID) || strings.Contains(text, "无关事项勿混入") {
+		t.Fatalf("同一交接中的其他事项不应出现在本事项经过中：\n%s", text)
+	}
+
+	// 退出再打开后，已保存的经过仍能查到。
+	f.reopen(t)
+	j2, err := f.svc.ItemJourney(it.ID)
+	if err != nil {
+		t.Fatalf("重开后 journey: %v", err)
+	}
+	if joinStrings(journeyKinds(j2)) != joinStrings(want) || len(j2.Results) != 2 {
+		t.Fatalf("重开后经过应完整保留：%v", journeyKinds(j2))
+	}
+}
+
+// TestItemJourneyReturnedAndResubmittedResult：退回未重新提交时当前结果显示
+// 等待交班人补充；重新提交后显示待处理、接班人尚未处理，且不显示成已接收、
+// 不改变事项当前班次。
+func TestItemJourneyReturnedAndResubmittedResult(t *testing.T) {
+	f := newFixture(t)
+	a, b, items := prepareHandover(t, f)
+	h, _ := f.svc.CreateHandover(a.ID, b.ID)
+	idA := items[0].ID
+	if _, err := f.svc.ProcessEntry(h.ID, idA, ActionReturn, "李四", "信息不全", "", ""); err != nil {
+		t.Fatalf("return: %v", err)
+	}
+
+	j, err := f.svc.ItemJourney(idA)
+	if err != nil {
+		t.Fatalf("journey: %v", err)
+	}
+	if len(j.Results) != 1 || j.Results[0].Entry.Status != EntryReturned {
+		t.Fatalf("当前结果应为退回：%+v", j.Results)
+	}
+	text := FormatItemJourney(j)
+	if !strings.Contains(text, "等待交班人补充") {
+		t.Fatalf("退回未补充时应显示等待交班人补充：\n%s", text)
+	}
+
+	if _, err := f.svc.ResubmitReturned(h.ID, idA, "张三", "已补齐"); err != nil {
+		t.Fatalf("resubmit: %v", err)
+	}
+	j, err = f.svc.ItemJourney(idA)
+	if err != nil {
+		t.Fatalf("journey after resubmit: %v", err)
+	}
+	if j.Results[0].Entry.Status != EntryPending {
+		t.Fatalf("重新提交后应恢复待处理：%+v", j.Results[0].Entry.Status)
+	}
+	text = FormatItemJourney(j)
+	if !strings.Contains(text, "待处理（接班人尚未处理）") {
+		t.Fatalf("重新提交后应显示待处理、接班人尚未处理：\n%s", text)
+	}
+	if strings.Contains(text, "当前结果：确认接收") || strings.Contains(text, "当前结果：继续跟踪") {
+		t.Fatalf("重新提交本身不能显示成已接收：\n%s", text)
+	}
+	// 上一轮退回人保留在历史里。
+	if !strings.Contains(text, "第1次退回 操作人=李四") {
+		t.Fatalf("上一轮退回人应保留在历史里：\n%s", text)
+	}
+	// 重新提交不改变事项当前班次。
+	if j.Item.CurrentShiftID != a.ID {
+		t.Fatalf("重新提交不应改变事项当前班次：%s", j.Item.CurrentShiftID)
+	}
+}
+
+// TestItemJourneyNoHandover：尚未参与交接的事项显示暂无交接记录，
+// 建立、修改、关闭记录仍然保留。
+func TestItemJourneyNoHandover(t *testing.T) {
+	f := newFixture(t)
+	a := mustShift(t, f, "调度", "张三", tsDay(2, 8, 0), tsDay(2, 16, 0), "")
+	it, err := f.svc.AddItem(a.ID, "本班事项", SeverityNormal, "", "李四")
+	if err != nil {
+		t.Fatalf("add: %v", err)
+	}
+	if _, err := f.svc.UpdateItem(it.ID, "本班事项（已核实）", SeverityImportant, "", "李四"); err != nil {
+		t.Fatalf("update: %v", err)
+	}
+	if _, err := f.svc.CloseItem(it.ID, "张三"); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+
+	j, err := f.svc.ItemJourney(it.ID)
+	if err != nil {
+		t.Fatalf("journey: %v", err)
+	}
+	if j.HasHandovers || len(j.Results) != 0 {
+		t.Fatalf("未参与交接不应有交接结果：%+v", j.Results)
+	}
+	got := journeyKinds(j)
+	if joinStrings(got) != "created,updated,closed" {
+		t.Fatalf("建立、修改、关闭记录都应保留：%v", got)
+	}
+	text := FormatItemJourney(j)
+	if !strings.Contains(text, "暂无交接记录") {
+		t.Fatalf("未参与交接应显示暂无交接记录：\n%s", text)
+	}
+	if !strings.Contains(text, "事项建立") || !strings.Contains(text, "关闭 操作人=张三") {
+		t.Fatalf("建立与关闭信息不应丢失：\n%s", text)
+	}
+}
+
+// TestItemJourneyNotFound：查询不存在的事项编号继续报明确错误。
+func TestItemJourneyNotFound(t *testing.T) {
+	f := newFixture(t)
+	if _, err := f.svc.ItemJourney("I999"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("不存在的事项应报 ErrNotFound，got %v", err)
+	}
+}
+
+// TestItemJourneyLegacyData：此前已经存在的交接记录同样纳入查询；
+// 缺少的人名或时间明确标为未记录，不推测补齐；同一时刻下同一交接内保持
+// 发起、退回、重新提交、后续处理的先后，不同时区按同一实际时刻比较。
+func TestItemJourneyLegacyData(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "data.json")
+	raw := `{
+  "shift_seq": 2, "item_seq": 1, "handover_seq": 1, "note_seq": 0,
+  "shifts": [
+    {"id":"S001","position":"调度","owner":"张三","start":"2026-10-02T08:00:00+08:00","end":"2026-10-02T16:00:00+08:00","created_at":"2026-10-02T08:00:00+08:00","closed":true},
+    {"id":"S002","position":"调度","owner":"李四","start":"2026-10-02T16:00:00+08:00","end":"2026-10-02T23:00:00+08:00","created_at":"2026-10-02T08:00:00+08:00","closed":false}
+  ],
+  "items": [
+    {"id":"I001","origin_shift_id":"S001","shift_ids":["S001"],"current_shift_id":"S001",
+     "content":"旧事项","severity":"normal","follow_owner":"李四",
+     "created_at":"2026-10-02T10:30:00+09:00",
+     "events":[{"at":"2026-10-02T10:30:00+09:00","kind":"created","detail":"事项建立"}]}
+  ],
+  "handovers": [
+    {"id":"H001","position":"调度","from_shift_id":"S001","to_shift_id":"S002",
+     "created_at":"2026-10-02T10:00:00+08:00",
+     "entries":[
+       {"item_id":"I001","content":"旧事项","severity":"normal","follow_owner":"李四",
+        "status":"confirmed","operator":"","processed_at":"2026-10-02T10:00:00+08:00",
+        "rounds":[{"seq":1,"returned_at":"2026-10-02T10:00:00+08:00","return_operator":"","reason":"旧退回原因",
+                   "supplement":"旧补充","supplement_operator":"",
+                   "supplement_at":"2026-10-02T10:00:00+08:00","resubmitted_at":"2026-10-02T10:00:00+08:00"}]}
+     ]}
+  ],
+  "notes": []
+}`
+	if err := os.WriteFile(path, []byte(raw), 0o644); err != nil {
+		t.Fatalf("write legacy: %v", err)
+	}
+	store, err := Open(path)
+	if err != nil {
+		t.Fatalf("open legacy: %v", err)
+	}
+	svc := NewService(store)
+
+	j, err := svc.ItemJourney("I001")
+	if err != nil {
+		t.Fatalf("legacy journey: %v", err)
+	}
+	// 事项建立于 10:30+09:00（即 09:30+08:00），早于交接发起 10:00+08:00；
+	// 同一交接内同一时刻保持发起、退回、重新提交、确认接收的先后。
+	want := []string{"created", "handover-init", "return", "resubmit", "confirm"}
+	if got := journeyKinds(j); joinStrings(got) != joinStrings(want) {
+		t.Fatalf("旧数据经过顺序不正确：want %v, got %v", want, got)
+	}
+	text := FormatItemJourney(j)
+	for _, want := range []string{"旧退回原因", "旧补充", "操作人=未记录", "补充人=未记录", "确认接收"} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("旧数据展示缺少 %q：\n%s", want, text)
+		}
+	}
+
+	// 缺少时间的旧记录明确标为未记录，且排在已记录时间之后。
+	raw2 := `{
+  "shift_seq": 2, "item_seq": 1, "handover_seq": 1, "note_seq": 0,
+  "shifts": [
+    {"id":"S001","position":"调度","owner":"张三","start":"2026-10-02T08:00:00+08:00","end":"2026-10-02T16:00:00+08:00","created_at":"2026-10-02T08:00:00+08:00","closed":true},
+    {"id":"S002","position":"调度","owner":"李四","start":"2026-10-02T16:00:00+08:00","end":"2026-10-02T23:00:00+08:00","created_at":"2026-10-02T08:00:00+08:00","closed":false}
+  ],
+  "items": [
+    {"id":"I001","origin_shift_id":"S001","shift_ids":["S001"],"current_shift_id":"S001",
+     "content":"旧事项","severity":"normal","follow_owner":"李四",
+     "created_at":"2026-10-02T09:00:00+08:00",
+     "events":[{"at":"2026-10-02T09:00:00+08:00","kind":"created","detail":"事项建立"}]}
+  ],
+  "handovers": [
+    {"id":"H001","position":"调度","from_shift_id":"S001","to_shift_id":"S002",
+     "created_at":"0001-01-01T00:00:00Z",
+     "entries":[
+       {"item_id":"I001","content":"旧事项","severity":"normal","follow_owner":"李四",
+        "status":"returned",
+        "rounds":[{"seq":1,"returned_at":"0001-01-01T00:00:00Z","return_operator":"","reason":"无时间退回"}]}
+     ]}
+  ],
+  "notes": []
+}`
+	if err := os.WriteFile(path, []byte(raw2), 0o644); err != nil {
+		t.Fatalf("write legacy2: %v", err)
+	}
+	store2, err := Open(path)
+	if err != nil {
+		t.Fatalf("open legacy2: %v", err)
+	}
+	j2, err := NewService(store2).ItemJourney("I001")
+	if err != nil {
+		t.Fatalf("legacy2 journey: %v", err)
+	}
+	if got := journeyKinds(j2); joinStrings(got) != "created,handover-init,return" {
+		t.Fatalf("缺时间的记录应排在已记录时间之后：%v", got)
+	}
+	if j2.Events[1].TimeKnown || j2.Events[2].TimeKnown {
+		t.Fatalf("缺时间的旧记录不应推测补齐：%+v", j2.Events)
+	}
+	text2 := FormatItemJourney(j2)
+	if !strings.Contains(text2, "未记录 交接 H001") || !strings.Contains(text2, "无时间退回") {
+		t.Fatalf("缺少时间应明确标为未记录：\n%s", text2)
+	}
+	if !strings.Contains(text2, "等待交班人补充") {
+		t.Fatalf("旧退回记录同样纳入当前结果：\n%s", text2)
+	}
+}

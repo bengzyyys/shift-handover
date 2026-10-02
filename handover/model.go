@@ -218,6 +218,38 @@ type OverlapNote struct {
 	CreatedAt time.Time `json:"created_at"`
 }
 
+// JourneyEvent 是事项处理经过中的一条记录：可能来自事项自身历史
+// （建立/修改/关闭/接收），也可能来自它参与的交接（发起交接、逐轮退回、
+// 补充后重新提交、确认接收、继续跟踪）。交接相关事件带有交接编号与交班、
+// 接班班次；Operator 为空表示该操作人未记录（旧数据可能缺人名）。
+type JourneyEvent struct {
+	At                 time.Time  // 实际发生时刻；TimeKnown 为 false 表示未记录
+	TimeKnown          bool       // At 是否有效（旧数据可能缺时间）
+	Kind               string     // created/updated/closed/received/handover-init/return/resubmit/confirm/track
+	Operator           string     // 实际操作人；空表示未记录
+	Detail             string     // 事项自身事件附带的说明
+	HandoverID         string     // 交接相关事件所属的交接编号
+	FromShift          string     // 交班班次
+	ToShift            string     // 接班班次
+	RoundSeq           int        // 退回/重新提交的轮次
+	Reason             string     // 该轮完整退回原因
+	Supplement         string     // 该轮补充说明
+	SupplementOperator string     // 补充人
+	SupplementAt       *time.Time // 补充时间
+	TrackingNote       string     // 继续跟踪的跟踪说明
+	FollowOwner        string     // 继续跟踪当时指定的后续负责人（不随后续修改改变）
+}
+
+// ItemJourney 是凭事项编号查询得到的完整处理经过：开头为事项最新状态，
+// Events 是合并事项自身历史与各次交接经过后的时间线，Results 是该事项在
+// 每次交接中的当前处理结果。
+type ItemJourney struct {
+	Item         Item
+	Events       []JourneyEvent // 按实际发生时刻排序（不同时区按同一实际时刻比较）
+	Results      []EntryView    // 按交接编号排列
+	HasHandovers bool           // false 表示尚未参与交接
+}
+
 // EntryView 把交接单项与其所属交接编号关联，用于按班次查询。
 type EntryView struct {
 	HandoverID string

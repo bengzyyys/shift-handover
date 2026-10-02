@@ -694,6 +694,140 @@ func (svc *Service) GetItem(id string) (Item, error) {
 	return *it, nil
 }
 
+// ItemJourney 凭事项编号汇总它从建立到当前的处理经过：保留事项自身的
+// 建立、修改、关闭记录，并加入它参与的各次交接（发起交接、逐轮退回、补充后
+// 重新提交、确认接收或继续跟踪），无须先知道涉及哪些交接编号。
+// 经过按实际发生时刻排序（带不同时区的时间按同一实际时刻比较）；同一时刻下
+// 同一交接内保持发起、该轮退回、该轮重新提交、后续处理的先后，不同交接按
+// 交接编号排列。同一次接收若已出现在事项历史里只展示一次。只读查询，
+// 不改变事项、交接进度或班次结束时记录。
+func (svc *Service) ItemJourney(itemID string) (ItemJourney, error) {
+	itemID = clean(itemID)
+	d := &svc.store.data
+	it, _ := findItem(d, itemID)
+	if it == nil {
+		return ItemJourney{}, fmt.Errorf("%w：事项 %s", ErrNotFound, itemID)
+	}
+	j := ItemJourney{Item: *it}
+
+	// 排序键：先按实际发生时刻（未记录时间的排最后），同一时刻下事项自身
+	// 事件在前，其后按交接编号分组，组内保持生成顺序（发起、逐轮退回、
+	// 该轮重新提交、后续处理）。
+	type keyedEvent struct {
+		ev    JourneyEvent
+		group string // "" 表示事项自身事件，否则为交接编号
+		ord   int    // 同一（时刻、分组）内的先后
+	}
+	var events []keyedEvent
+	seq := 0
+	add := func(ev JourneyEvent, group string) {
+		events = append(events, keyedEvent{ev: ev, group: group, ord: seq})
+		seq++
+	}
+
+	// received 事件与交接中的接收处理是同一次接收，只展示一次（以交接事件
+	// 展示，信息更全）；匹配不上的旧数据 received 事件仍原样保留。
+	receivedUsed := make([]bool, len(it.Events))
+
+	hs := append([]Handover(nil), d.Handovers...)
+	sort.Slice(hs, func(i, k int) bool { return hs[i].ID < hs[k].ID })
+	for k := range hs {
+		h := &hs[k]
+		e, _ := findEntry(h, itemID)
+		if e == nil {
+			continue
+		}
+		j.HasHandovers = true
+		j.Results = append(j.Results, EntryView{
+			HandoverID: h.ID,
+			FromShift:  h.FromShiftID,
+			ToShift:    h.ToShiftID,
+			Entry:      *e,
+		})
+
+		// 发起交接：交接记录本身不记操作人，明确显示未记录，不以班次负责人代替。
+		add(JourneyEvent{
+			At: h.CreatedAt, TimeKnown: !h.CreatedAt.IsZero(),
+			Kind: "handover-init", HandoverID: h.ID, FromShift: h.FromShiftID, ToShift: h.ToShiftID,
+		}, h.ID)
+		for _, r := range e.Rounds {
+			add(JourneyEvent{
+				At: r.ReturnedAt, TimeKnown: !r.ReturnedAt.IsZero(),
+				Kind: "return", Operator: r.ReturnOperator,
+				HandoverID: h.ID, FromShift: h.FromShiftID, ToShift: h.ToShiftID,
+				RoundSeq: r.Seq, Reason: r.Reason,
+			}, h.ID)
+			if r.ResubmittedAt != nil {
+				add(JourneyEvent{
+					At: *r.ResubmittedAt, TimeKnown: !r.ResubmittedAt.IsZero(),
+					Kind: "resubmit", Operator: r.SupplementOperator,
+					HandoverID: h.ID, FromShift: h.FromShiftID, ToShift: h.ToShiftID,
+					RoundSeq: r.Seq, Supplement: r.Supplement,
+					SupplementOperator: r.SupplementOperator, SupplementAt: r.SupplementAt,
+				}, h.ID)
+			}
+		}
+		if e.Status.Received() {
+			kind := "confirm"
+			if e.Status == EntryTracking {
+				kind = "track"
+			}
+			ev := JourneyEvent{
+				Kind: kind, Operator: e.Operator,
+				HandoverID: h.ID, FromShift: h.FromShiftID, ToShift: h.ToShiftID,
+				TrackingNote: e.TrackingNote,
+				// 继续跟踪当时指定的后续负责人取自交接记录快照，
+				// 之后修改事项负责人不改变这里的历史值。
+				FollowOwner: e.FollowOwner,
+			}
+			if e.ProcessedAt != nil {
+				ev.At, ev.TimeKnown = *e.ProcessedAt, true
+			}
+			add(ev, h.ID)
+			if e.ProcessedAt != nil {
+				for i := range it.Events {
+					iev := &it.Events[i]
+					if iev.Kind == "received" && !receivedUsed[i] &&
+						iev.At.Equal(*e.ProcessedAt) && iev.Operator == e.Operator {
+						receivedUsed[i] = true
+						break
+					}
+				}
+			}
+		}
+	}
+
+	// 事项自身历史：建立、修改、关闭原样保留；未被交接接收事件覆盖的
+	// received 事件（旧数据）也保留。
+	for i, iev := range it.Events {
+		if iev.Kind == "received" && receivedUsed[i] {
+			continue
+		}
+		add(JourneyEvent{
+			At: iev.At, TimeKnown: !iev.At.IsZero(),
+			Kind: iev.Kind, Operator: iev.Operator, Detail: iev.Detail,
+		}, "")
+	}
+
+	sort.SliceStable(events, func(i, k int) bool {
+		a, b := events[i], events[k]
+		if a.ev.TimeKnown != b.ev.TimeKnown {
+			return a.ev.TimeKnown
+		}
+		if a.ev.TimeKnown && !a.ev.At.Equal(b.ev.At) {
+			return a.ev.At.Before(b.ev.At)
+		}
+		if a.group != b.group {
+			return a.group < b.group
+		}
+		return a.ord < b.ord
+	})
+	for _, ke := range events {
+		j.Events = append(j.Events, ke.ev)
+	}
+	return j, nil
+}
+
 // GetHandover 按编号查询交接。
 func (svc *Service) GetHandover(id string) (Handover, error) {
 	h, _ := findHandover(&svc.store.data, clean(id))
