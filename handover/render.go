@@ -87,6 +87,15 @@ func fmtTimePtrIfRecorded(t *time.Time) string {
 	return fmtTime(*t)
 }
 
+// fmtProcessedAtIfRecorded 展示处理时间，缺失（nil）或旧数据零值
+// （0001-01-01T00:00:00Z）时明确标为未记录，不推测补齐。
+func fmtProcessedAtIfRecorded(t *time.Time) string {
+	if t == nil || t.IsZero() {
+		return "未记录"
+	}
+	return fmtTime(*t)
+}
+
 // entryCurrentResultLabel 是交接当前结果在事项处理经过查询中的展示名。
 func entryCurrentResultLabel(s EntryStatus) string {
 	switch s {
@@ -163,9 +172,12 @@ func FormatItemJourney(j ItemJourney) string {
 	}
 	for _, r := range j.Results {
 		operator, processedAt := "尚未处理", "尚未处理"
-		if r.Entry.ProcessedAt != nil {
+		if r.Entry.Status != EntryPending {
+			// 已有处理结果（确认接收/继续跟踪/退回）时如实展示：处理人与
+			// 处理时间各自独立，缺失的明确标为未记录，不连带隐藏已保存的
+			// 处理人，也不把已处理结果显示成尚未处理。
 			operator = whoIfRecorded(r.Entry.Operator)
-			processedAt = fmtTime(*r.Entry.ProcessedAt)
+			processedAt = fmtProcessedAtIfRecorded(r.Entry.ProcessedAt)
 		}
 		fmt.Fprintf(&b, "    交接 %s（%s -> %s）当前结果：%s；处理人=%s；处理时间=%s\n",
 			r.HandoverID, r.FromShift, r.ToShift,

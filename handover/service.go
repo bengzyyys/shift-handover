@@ -617,6 +617,10 @@ func (svc *Service) ProcessEntry(handoverID, itemID string, action EntryAction, 
 	return result, err
 }
 
+// validProcessedAt 报告处理时间是否真实记录：nil 或零值
+// （0001-01-01T00:00:00Z）都视为未记录，不推测补齐。
+func validProcessedAt(t *time.Time) bool { return t != nil && !t.IsZero() }
+
 func contains(xs []string, x string) bool {
 	for _, v := range xs {
 		if v == x {
@@ -792,11 +796,13 @@ func (svc *Service) ItemJourney(itemID string) (ItemJourney, error) {
 				// 之后修改事项负责人不改变这里的历史值。
 				FollowOwner: e.FollowOwner,
 			}
-			if e.ProcessedAt != nil {
+			// 处理时间缺失或为旧数据零值时仍保留该处理事件，
+			// 时间标为未记录，排在有真实时间的事件之后。
+			if validProcessedAt(e.ProcessedAt) {
 				ev.At, ev.TimeKnown = *e.ProcessedAt, true
 			}
 			add(ev, h.ID)
-			if e.ProcessedAt != nil {
+			if validProcessedAt(e.ProcessedAt) {
 				for i := range it.Events {
 					iev := &it.Events[i]
 					if iev.Kind == "received" && !receivedUsed[i] &&
