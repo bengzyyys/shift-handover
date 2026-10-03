@@ -223,10 +223,16 @@ func FormatEntry(e HandoverEntry) string {
 		e.ItemID, e.Status.Label(), e.Severity.Label(), e.FollowOwner)
 	fmt.Fprintf(&b, "  原文：%s\n", e.Content)
 	fmt.Fprintf(&b, "  限制条件：%s\n", dashIfEmpty(e.Constraints))
-	if e.ProcessedAt == nil {
+	// 是否处理过以已保存的处理结果（状态）为准，而不是处理时间：旧记录可能
+	// 有结果却缺处理人或处理时间。确认接收/继续跟踪/退回都属于已经发生的处理，
+	// 处理人与处理时间各自独立展示，缺失（含零值 0001-01-01T00:00:00Z）明确
+	// 标为未记录，不连带隐藏已保存的姓名，也不显示公元元年日期；只有真正待处理
+	// （含退回后已补充重新提交、等待接班人再次处理）才显示尚未处理。
+	if e.Status == EntryPending {
 		b.WriteString("  最后处理：尚未处理（等待接班人处理）\n")
 	} else {
-		fmt.Fprintf(&b, "  最后处理：操作人=%s 时间=%s\n", dashIfEmpty(e.Operator), fmtTimePtr(e.ProcessedAt))
+		fmt.Fprintf(&b, "  最后处理：操作人=%s 时间=%s\n",
+			whoIfRecorded(e.Operator), fmtProcessedAtIfRecorded(e.ProcessedAt))
 	}
 	if e.Status == EntryTracking || e.TrackingNote != "" {
 		fmt.Fprintf(&b, "  跟踪说明：%s\n", dashIfEmpty(e.TrackingNote))
@@ -334,9 +340,16 @@ func FormatReport(rep ShiftReport) string {
 	for _, id := range ids {
 		views := rep.Results[id]
 		for _, v := range views {
-			operator, processedAt := dashIfEmpty(v.Entry.Operator), fmtTimePtr(v.Entry.ProcessedAt)
-			if v.Entry.ProcessedAt == nil {
-				operator, processedAt = "尚未处理", "尚未处理"
+			// 是否处理过以已保存的处理结果（状态）为准：确认接收/继续跟踪/
+			// 退回都属于已发生的处理，处理人与处理时间各自独立展示，缺失
+			// （含零值 0001-01-01T00:00:00Z）明确标为未记录；只有真正待处理
+			// （含退回后已补充重新提交、等待接班人再次处理）才把两者都显示为
+			// 尚未处理。该口径与报告内嵌的交接清单（FormatEntry）及 item-show
+			// 完全一致。
+			operator, processedAt := "尚未处理", "尚未处理"
+			if v.Entry.Status != EntryPending {
+				operator = whoIfRecorded(v.Entry.Operator)
+				processedAt = fmtProcessedAtIfRecorded(v.Entry.ProcessedAt)
 			}
 			fmt.Fprintf(&b, "  事项 %s 交接 %s（%s -> %s）当前结果：%s；处理人=%s；处理时间=%s\n",
 				id, v.HandoverID, v.FromShift, v.ToShift,
