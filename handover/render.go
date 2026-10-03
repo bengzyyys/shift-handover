@@ -106,6 +106,8 @@ func fmtProcessedAtIfRecorded(t *time.Time) string {
 }
 
 // entryCurrentResultLabel 是交接当前结果在事项处理经过查询中的展示名。
+// 缺失或空结果显示“处理结果未记录”，无法识别的结果显示“处理结果无法识别”
+// 并带出保存的原值，与交接清单、班次报告表达同一事实，不推测成已接收。
 func entryCurrentResultLabel(s EntryStatus) string {
 	switch s {
 	case EntryPending:
@@ -116,8 +118,10 @@ func entryCurrentResultLabel(s EntryStatus) string {
 		return "确认接收"
 	case EntryTracking:
 		return "继续跟踪（已接收）"
+	case "":
+		return "处理结果未记录"
 	}
-	return string(s)
+	return "处理结果无法识别（原值：" + string(s) + "）"
 }
 
 // FormatJourneyEvent 格式化处理经过中的单条记录。交接相关记录带有交接

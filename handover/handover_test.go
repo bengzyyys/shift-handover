@@ -2376,3 +2376,238 @@ func TestLegacyReturnedRoundsMissingPeopleAndTime(t *testing.T) {
 		t.Fatalf("班次查询不应出现公元元年日期：\n%s", rtext)
 	}
 }
+
+// legacyUncertainResultRaw 构造一份旧数据：同一交接中 I001 已确认接收（缺处理人
+// 与处理时间，仍算接收）、I002 处理结果缺失（空）、I003 处理结果无法识别；
+// 交接记录里甚至已写入完成时间，也不能掩盖清单中的不确定结果。
+const legacyUncertainResultRaw = `{
+  "shift_seq": 2, "item_seq": 3, "handover_seq": 1, "note_seq": 0,
+  "shifts": [
+    {"id":"S001","position":"调度","owner":"张三","start":"2026-10-02T08:00:00+08:00","end":"2026-10-02T16:00:00+08:00","created_at":"2026-10-02T08:00:00+08:00","closed":true,"closed_at":"2026-10-02T16:00:00+08:00"},
+    {"id":"S002","position":"调度","owner":"李四","start":"2026-10-02T16:00:00+08:00","end":"2026-10-02T23:00:00+08:00","created_at":"2026-10-02T08:00:00+08:00","closed":false}
+  ],
+  "items": [
+    {"id":"I001","origin_shift_id":"S001","shift_ids":["S001"],"current_shift_id":"S001",
+     "content":"已确认旧事项","severity":"normal","follow_owner":"李四",
+     "created_at":"2026-10-02T09:00:00+08:00",
+     "events":[{"at":"2026-10-02T09:00:00+08:00","kind":"created","detail":"事项建立"}]},
+    {"id":"I002","origin_shift_id":"S001","shift_ids":["S001"],"current_shift_id":"S001",
+     "content":"结果缺失事项","severity":"normal","follow_owner":"李四",
+     "created_at":"2026-10-02T09:10:00+08:00",
+     "events":[{"at":"2026-10-02T09:10:00+08:00","kind":"created","detail":"事项建立"}]},
+    {"id":"I003","origin_shift_id":"S001","shift_ids":["S001"],"current_shift_id":"S001",
+     "content":"结果无法识别事项","severity":"normal","follow_owner":"李四",
+     "created_at":"2026-10-02T09:20:00+08:00",
+     "events":[{"at":"2026-10-02T09:20:00+08:00","kind":"created","detail":"事项建立"}]}
+  ],
+  "handovers": [
+    {"id":"H001","position":"调度","from_shift_id":"S001","to_shift_id":"S002",
+     "created_at":"2026-10-02T10:00:00+08:00","completed_at":"2026-10-02T15:00:00+08:00",
+     "entries":[
+       {"item_id":"I001","content":"已确认旧事项","severity":"normal","follow_owner":"李四",
+        "status":"confirmed"},
+       {"item_id":"I002","content":"结果缺失事项","severity":"normal","follow_owner":"李四",
+        "status":""},
+       {"item_id":"I003","content":"结果无法识别事项","severity":"normal","follow_owner":"李四",
+        "status":"archived"}
+     ]}
+  ],
+  "notes": []
+}`
+
+// TestUncertainEntryResultKeepsHandoverIncomplete：清单中存在结果缺失或无法识别
+// 的事项时，即使其他项已接收、记录里已有完成时间，交接也显示未完成；
+// 缺失结果显示“处理结果未记录”，无法识别的结果显示“处理结果无法识别”并带出原值。
+func TestUncertainEntryResultKeepsHandoverIncomplete(t *testing.T) {
+	svc := openLegacyService(t, legacyUncertainResultRaw)
+
+	h, err := svc.GetHandover("H001")
+	if err != nil {
+		t.Fatalf("get handover: %v", err)
+	}
+	if h.Completed() {
+		t.Fatalf("存在结果缺失/无法识别事项时交接不应完成")
+	}
+	htext := FormatHandover(h)
+	if !strings.Contains(htext, "未完成") || strings.Contains(htext, "已完成") {
+		t.Fatalf("已有完成时间也不能显示成已完成：\n%s", htext)
+	}
+	if !strings.Contains(htext, "[确认接收]") {
+		t.Fatalf("已确认项仍应显示确认接收：\n%s", htext)
+	}
+	if !strings.Contains(htext, "[处理结果未记录]") {
+		t.Fatalf("缺失结果应显示处理结果未记录：\n%s", htext)
+	}
+	if !strings.Contains(htext, "处理结果无法识别（原值：archived）") {
+		t.Fatalf("无法识别结果应显示处理结果无法识别并带出原值：\n%s", htext)
+	}
+}
+
+// TestUncertainEntryResultBlocksShiftClose：接班班次收到的交接中存在结果缺失或
+// 无法识别的事项时，结束班次明确失败，班次保持进行中，不写结束时间与结束时记录，
+// 原交接结果、事项归属与处理经过不变；逐项处理修复后才能结束。
+func TestUncertainEntryResultBlocksShiftClose(t *testing.T) {
+	svc := openLegacyService(t, legacyUncertainResultRaw)
+	svc.nowAt(func() time.Time { return tsDay(2, 20, 0) })
+
+	snapshot := func() string {
+		rep, err := svc.ShiftReport("S002")
+		if err != nil {
+			t.Fatalf("report: %v", err)
+		}
+		raw, err := json.Marshal(rep)
+		if err != nil {
+			t.Fatalf("marshal: %v", err)
+		}
+		return string(raw)
+	}
+	before := snapshot()
+
+	if _, err := svc.CloseShift("S002"); !errors.Is(err, ErrHandoverState) {
+		t.Fatalf("存在未确认接收事项时结束应报 ErrHandoverState，got %v", err)
+	}
+	sh, err := svc.GetShift("S002")
+	if err != nil {
+		t.Fatalf("get shift: %v", err)
+	}
+	if sh.Closed || sh.ClosedAt != nil || sh.CloseRecord != nil {
+		t.Fatalf("结束失败应保持进行中，不写结束时间与结束时记录：%+v", sh)
+	}
+	if after := snapshot(); after != before {
+		t.Fatalf("拒绝结束不得改变交接结果、事项归属与处理经过\nbefore %s\nafter  %s", before, after)
+	}
+
+	// 缺失结果与无法识别结果都可以按现有逐项处理功能明确接收。
+	if _, err := svc.ProcessEntry("H001", "I002", ActionConfirm, "李四", "", "", ""); err != nil {
+		t.Fatalf("处理结果缺失项应能确认接收：%v", err)
+	}
+	if _, err := svc.ProcessEntry("H001", "I003", ActionTrack, "李四", "", "继续跟进", "王五"); err != nil {
+		t.Fatalf("无法识别结果项应能继续跟踪：%v", err)
+	}
+	h, err := svc.GetHandover("H001")
+	if err != nil {
+		t.Fatalf("get handover: %v", err)
+	}
+	// I001 是已明确接收的旧记录，缺少处理人与处理时间也仍算接收，不需要重新处理。
+	if !h.Completed() || h.CompletedAt == nil {
+		t.Fatalf("全部明确接收后交接应完成：%+v", h)
+	}
+	if _, err := svc.CloseShift("S002"); err != nil {
+		t.Fatalf("全部明确接收后应能结束班次：%v", err)
+	}
+}
+
+// TestUncertainResultConsistentAcrossQueries：交接查询、交班与接班两侧的班次报告、
+// 事项处理经过对结果缺失/无法识别的事项表达同一事实，不展示成已确认，也不从事项
+// 所在班次、处理人、处理时间或退回历史推测接收结果。
+func TestUncertainResultConsistentAcrossQueries(t *testing.T) {
+	svc := openLegacyService(t, legacyUncertainResultRaw)
+
+	for _, shiftID := range []string{"S001", "S002"} {
+		rep, err := svc.ShiftReport(shiftID)
+		if err != nil {
+			t.Fatalf("report %s: %v", shiftID, err)
+		}
+		rtext := FormatReport(rep)
+		if !strings.Contains(rtext, "事项 I002 交接 H001（S001 -> S002）当前结果：处理结果未记录") {
+			t.Fatalf("shift-show %s 应把缺失结果显示为处理结果未记录：\n%s", shiftID, rtext)
+		}
+		if !strings.Contains(rtext, "事项 I003 交接 H001（S001 -> S002）当前结果：处理结果无法识别（原值：archived）") {
+			t.Fatalf("shift-show %s 应把无法识别结果显示原值：\n%s", shiftID, rtext)
+		}
+		if !strings.Contains(rtext, "[处理结果未记录]") || !strings.Contains(rtext, "处理结果无法识别（原值：archived）") {
+			t.Fatalf("shift-show %s 嵌入的交接清单应与结果说明一致：\n%s", shiftID, rtext)
+		}
+		if strings.Contains(rtext, "I002 交接 H001（S001 -> S002）当前结果：确认接收") ||
+			strings.Contains(rtext, "I003 交接 H001（S001 -> S002）当前结果：确认接收") {
+			t.Fatalf("shift-show %s 不得把不确定结果展示成已确认：\n%s", shiftID, rtext)
+		}
+	}
+
+	// 事项处理经过：不确定结果不产生接收事件，当前结果如实展示。
+	j2, err := svc.ItemJourney("I002")
+	if err != nil {
+		t.Fatalf("journey I002: %v", err)
+	}
+	if got := journeyKinds(j2); joinStrings(got) != "created,handover-init" {
+		t.Fatalf("结果缺失不应推测出接收事件：%v", got)
+	}
+	text2 := FormatItemJourney(j2)
+	if !strings.Contains(text2, "当前结果：处理结果未记录") {
+		t.Fatalf("item-show 应显示处理结果未记录：\n%s", text2)
+	}
+	if strings.Contains(text2, "确认接收") || strings.Contains(text2, "继续跟踪") {
+		t.Fatalf("item-show 不得把缺失结果展示成已接收：\n%s", text2)
+	}
+
+	j3, err := svc.ItemJourney("I003")
+	if err != nil {
+		t.Fatalf("journey I003: %v", err)
+	}
+	if got := journeyKinds(j3); joinStrings(got) != "created,handover-init" {
+		t.Fatalf("无法识别结果不应推测出接收事件：%v", got)
+	}
+	text3 := FormatItemJourney(j3)
+	if !strings.Contains(text3, "当前结果：处理结果无法识别（原值：archived）") {
+		t.Fatalf("item-show 应显示处理结果无法识别并带出原值：\n%s", text3)
+	}
+}
+
+// TestUncertainResultInOneHandoverBlocksShiftClose：同一班次收到多条交接时，
+// 其他交接全部完成也不能放行存在不确定结果的交接。
+func TestUncertainResultInOneHandoverBlocksShiftClose(t *testing.T) {
+	f := newFixture(t)
+	a := mustShift(t, f, "调度", "张三", tsDay(2, 8, 0), tsDay(2, 12, 0), "")
+	b := mustShift(t, f, "调度", "李四", tsDay(2, 12, 0), tsDay(2, 16, 0), "")
+	c := mustShift(t, f, "调度", "王五", tsDay(2, 16, 0), tsDay(2, 23, 0), "")
+	itA, err := f.svc.AddItem(a.ID, "甲班事项", SeverityNormal, "", "王五")
+	if err != nil {
+		t.Fatalf("add a: %v", err)
+	}
+	itB, err := f.svc.AddItem(b.ID, "乙班事项", SeverityNormal, "", "王五")
+	if err != nil {
+		t.Fatalf("add b: %v", err)
+	}
+	if _, err := f.svc.CloseShift(a.ID); err != nil {
+		t.Fatalf("close a: %v", err)
+	}
+	if _, err := f.svc.CloseShift(b.ID); err != nil {
+		t.Fatalf("close b: %v", err)
+	}
+	h1, err := f.svc.CreateHandover(a.ID, c.ID)
+	if err != nil {
+		t.Fatalf("handover a->c: %v", err)
+	}
+	h2, err := f.svc.CreateHandover(b.ID, c.ID)
+	if err != nil {
+		t.Fatalf("handover b->c: %v", err)
+	}
+	// h1 正常确认完成；h2 的清单被旧数据写成无法识别的结果。
+	if _, err := f.svc.ProcessEntry(h1.ID, itA.ID, ActionConfirm, "王五", "", "", ""); err != nil {
+		t.Fatalf("confirm h1: %v", err)
+	}
+	for i := range f.store.data.Handovers {
+		if f.store.data.Handovers[i].ID == h2.ID {
+			f.store.data.Handovers[i].Entries[0].Status = EntryStatus("archived")
+		}
+	}
+	if got := mustGetHandover(t, f, h2.ID); got.Completed() {
+		t.Fatalf("无法识别结果应使交接未完成")
+	}
+
+	if _, err := f.svc.CloseShift(c.ID); !errors.Is(err, ErrHandoverState) {
+		t.Fatalf("其他交接已完成也不能放行不确定结果，got %v", err)
+	}
+	sh, _ := f.svc.GetShift(c.ID)
+	if sh.Closed {
+		t.Fatalf("班次应保持进行中")
+	}
+
+	// 明确接收后两条交接都完成，班次可以结束。
+	if _, err := f.svc.ProcessEntry(h2.ID, itB.ID, ActionConfirm, "王五", "", "", ""); err != nil {
+		t.Fatalf("修复不确定结果：%v", err)
+	}
+	if _, err := f.svc.CloseShift(c.ID); err != nil {
+		t.Fatalf("全部交接完成后应能结束：%v", err)
+	}
+}

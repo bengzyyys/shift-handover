@@ -55,7 +55,9 @@ const (
 	EntryReturned  EntryStatus = "returned"  // 退回
 )
 
-// Label 返回交接结果的中文展示名。
+// Label 返回交接结果的中文展示名。缺失或空结果显示“处理结果未记录”；
+// 不属于现有四种结果的原值显示“处理结果无法识别”并带出保存的原值，
+// 不推测成任何一种已知结果。
 func (s EntryStatus) Label() string {
 	switch s {
 	case EntryPending:
@@ -66,8 +68,10 @@ func (s EntryStatus) Label() string {
 		return "继续跟踪"
 	case EntryReturned:
 		return "退回"
+	case "":
+		return "处理结果未记录"
 	}
-	return string(s)
+	return "处理结果无法识别（原值：" + string(s) + "）"
 }
 
 // Received 报告该结果是否表示接班班次已经接收。
@@ -197,11 +201,13 @@ type Handover struct {
 	Entries     []HandoverEntry `json:"entries"`
 }
 
-// Completed 报告交接是否已完成。
+// Completed 报告交接是否已完成。完成以清单里每一项都明确为确认接收或
+// 继续跟踪为准：待处理、退回、结果缺失（空）或无法识别都使交接保持未完成，
+// 其他项全部已接收也不能抵消不确定项；空清单直接完成。判定只看清单中保存的
+// 处理结果，不以已完成时间、事项所在班次、处理人或退回历史推测接收。
 func (h *Handover) Completed() bool {
 	for i := range h.Entries {
-		st := h.Entries[i].Status
-		if st == EntryPending || st == EntryReturned {
+		if !h.Entries[i].Status.Received() {
 			return false
 		}
 	}
