@@ -2046,3 +2046,88 @@ func TestItemJourneyLegacyData(t *testing.T) {
 		t.Fatalf("旧退回记录同样纳入当前结果：\n%s", text2)
 	}
 }
+
+// TestItemJourneyProcessedButTimeMissing：旧记录已确认接收或继续跟踪但没保存
+// 处理时间（缺失或零值 0001-01-01T00:00:00Z）时，当前结果仍显示已保存的处理
+// 结果，处理人有记录显示原姓名、缺失显示未记录，处理时间显示未记录，不能
+// 改写成尚未处理；处理经过保留接收事件并排在有真实时间的事件之后，不显示
+// 公元元年的日期，也不用其他时间补齐。
+func TestItemJourneyProcessedButTimeMissing(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "data.json")
+	raw := `{
+  "shift_seq": 3, "item_seq": 1, "handover_seq": 2, "note_seq": 0,
+  "shifts": [
+    {"id":"S001","position":"调度","owner":"张三","start":"2026-10-02T08:00:00+08:00","end":"2026-10-02T16:00:00+08:00","created_at":"2026-10-02T08:00:00+08:00","closed":true},
+    {"id":"S002","position":"调度","owner":"李四","start":"2026-10-02T16:00:00+08:00","end":"2026-10-02T23:00:00+08:00","created_at":"2026-10-02T08:00:00+08:00","closed":true},
+    {"id":"S003","position":"调度","owner":"赵六","start":"2026-10-02T23:00:00+08:00","end":"2026-10-03T07:00:00+08:00","created_at":"2026-10-02T08:00:00+08:00","closed":false}
+  ],
+  "items": [
+    {"id":"I001","origin_shift_id":"S001","shift_ids":["S001","S002"],"current_shift_id":"S002",
+     "content":"旧事项","severity":"normal","follow_owner":"王五",
+     "created_at":"2026-10-02T09:00:00+08:00",
+     "events":[{"at":"2026-10-02T09:00:00+08:00","kind":"created","detail":"事项建立"}]}
+  ],
+  "handovers": [
+    {"id":"H001","position":"调度","from_shift_id":"S001","to_shift_id":"S002",
+     "created_at":"2026-10-02T10:00:00+08:00",
+     "entries":[
+       {"item_id":"I001","content":"旧事项","severity":"normal","follow_owner":"李四",
+        "status":"confirmed","operator":"李四"}
+     ]},
+    {"id":"H002","position":"调度","from_shift_id":"S002","to_shift_id":"S003",
+     "created_at":"2026-10-02T23:00:00+08:00",
+     "entries":[
+       {"item_id":"I001","content":"旧事项","severity":"normal","follow_owner":"王五",
+        "status":"tracking","processed_at":"0001-01-01T00:00:00Z",
+        "tracking_note":"每班记录一次"}
+     ]}
+  ],
+  "notes": []
+}`
+	if err := os.WriteFile(path, []byte(raw), 0o644); err != nil {
+		t.Fatalf("write legacy: %v", err)
+	}
+	store, err := Open(path)
+	if err != nil {
+		t.Fatalf("open legacy: %v", err)
+	}
+	j, err := NewService(store).ItemJourney("I001")
+	if err != nil {
+		t.Fatalf("journey: %v", err)
+	}
+
+	// 缺时间的确认与继续跟踪事件保留，排在有真实时间的事件之后，
+	// 未记录时间的事件之间保持交接编号次序。
+	want := []string{"created", "handover-init", "handover-init", "confirm", "track"}
+	if got := journeyKinds(j); joinStrings(got) != joinStrings(want) {
+		t.Fatalf("缺时间的接收事件顺序不正确：want %v, got %v", want, got)
+	}
+	for _, ev := range j.Events {
+		if (ev.Kind == "confirm" || ev.Kind == "track") && ev.TimeKnown {
+			t.Fatalf("缺处理时间的 %s 事件不应推测时间：%+v", ev.Kind, ev)
+		}
+	}
+
+	text := FormatItemJourney(j)
+	if strings.Contains(text, "0001-01-01") {
+		t.Fatalf("零值时间不能显示为公元元年：\n%s", text)
+	}
+	// 已保存的处理结果不因缺时间改写成尚未处理；处理人有记录显示原姓名，
+	// 缺失显示未记录；处理时间一律显示未记录。
+	for _, want := range []string{
+		"交接 H001（S001 -> S002）当前结果：确认接收；处理人=李四；处理时间=未记录",
+		"交接 H002（S002 -> S003）当前结果：继续跟踪（已接收）；处理人=未记录；处理时间=未记录",
+	} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("当前结果缺少 %q：\n%s", want, text)
+		}
+	}
+	if strings.Contains(text, "尚未处理") {
+		t.Fatalf("已处理记录不能显示为尚未处理：\n%s", text)
+	}
+	// 继续跟踪的历史说明与当时指定的负责人仍按原记录展示。
+	if !strings.Contains(text, "跟踪说明=每班记录一次") || !strings.Contains(text, "后续负责人=王五") {
+		t.Fatalf("继续跟踪历史说明与负责人应按原记录展示：\n%s", text)
+	}
+}

@@ -792,15 +792,17 @@ func (svc *Service) ItemJourney(itemID string) (ItemJourney, error) {
 				// 之后修改事项负责人不改变这里的历史值。
 				FollowOwner: e.FollowOwner,
 			}
-			if e.ProcessedAt != nil {
-				ev.At, ev.TimeKnown = *e.ProcessedAt, true
+			// 处理时间缺失或为零值（0001-01-01T00:00:00Z）都视为未记录：
+			// 事件保留并排在有真实时间的事件之后，不用其他时间推测补齐。
+			if pt := validProcessedAt(e.ProcessedAt); pt != nil {
+				ev.At, ev.TimeKnown = *pt, true
 			}
 			add(ev, h.ID)
-			if e.ProcessedAt != nil {
+			if pt := validProcessedAt(e.ProcessedAt); pt != nil {
 				for i := range it.Events {
 					iev := &it.Events[i]
 					if iev.Kind == "received" && !receivedUsed[i] &&
-						iev.At.Equal(*e.ProcessedAt) && iev.Operator == e.Operator {
+						iev.At.Equal(*pt) && iev.Operator == e.Operator {
 						receivedUsed[i] = true
 						break
 					}
