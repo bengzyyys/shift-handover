@@ -231,11 +231,11 @@ func dispatch(svc *handover.Service, cmd string, args []string) (string, error) 
 		return "已关闭事项\n" + handover.FormatItem(it), nil
 
 	case "item-show":
-		it, err := svc.GetItem(id)
+		rep, err := svc.ItemReport(id)
 		if err != nil {
 			return "", err
 		}
-		return handover.FormatItem(it), nil
+		return handover.FormatItemReport(rep), nil
 
 	case "handover-create":
 		h, err := svc.CreateHandover(from, to)

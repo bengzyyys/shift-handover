@@ -703,6 +703,30 @@ func (svc *Service) GetHandover(id string) (Handover, error) {
 	return *h, nil
 }
 
+// ItemReport 按事项编号汇总其最新状态、自带历史事件与参与的全部交接经过。
+// 只读取数据，不改变事项、交接进度或班次结束时记录。
+func (svc *Service) ItemReport(id string) (ItemReport, error) {
+	id = clean(id)
+	d := &svc.store.data
+	it, _ := findItem(d, id)
+	if it == nil {
+		return ItemReport{}, fmt.Errorf("%w：事项 %s", ErrNotFound, id)
+	}
+	rep := ItemReport{Item: *it}
+	for i := range d.Handovers {
+		h := &d.Handovers[i]
+		e, _ := findEntry(h, it.ID)
+		if e == nil {
+			continue
+		}
+		rep.Handovers = append(rep.Handovers, ItemHandover{Handover: *h, Entry: *e})
+	}
+	sort.Slice(rep.Handovers, func(i, j int) bool {
+		return rep.Handovers[i].Handover.ID < rep.Handovers[j].Handover.ID
+	})
+	return rep, nil
+}
+
 // ListHandovers 返回全部交接记录，按编号排序。
 func (svc *Service) ListHandovers() []Handover {
 	out := append([]Handover(nil), svc.store.data.Handovers...)

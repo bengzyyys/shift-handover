@@ -226,6 +226,20 @@ type EntryView struct {
 	Entry      HandoverEntry
 }
 
+// ItemHandover 汇总某事项参与的一次交接及其单项记录，供事项历史查询。
+type ItemHandover struct {
+	Handover Handover
+	Entry    HandoverEntry
+}
+
+// ItemReport 是按事项编号查询得到的完整视图：事项最新状态、自带历史事件，
+// 以及该事项参与的全部交接经过（发起、逐轮退回、补充后重新提交、接收或
+// 继续跟踪）。交接记录按交接编号排列。
+type ItemReport struct {
+	Item      Item
+	Handovers []ItemHandover
+}
+
 // ShiftReport 是按班次查询得到的完整视图。
 type ShiftReport struct {
 	Shift        Shift
