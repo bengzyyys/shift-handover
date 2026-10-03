@@ -361,9 +361,12 @@ func (svc *Service) CloseItem(itemID, operator string) (Item, error) {
 	return closed, err
 }
 
-// CloseShift 结束班次。接班交接仍有待处理或退回项时不允许结束；空清单也可以结束。
+// CloseShift 结束班次。任一接班交接中存在未明确接收的事项（待处理、退回，
+// 或处理结果缺失、为空、无法识别）时不允许结束；其他交接已完成也不能放行；
+// 空清单也可以结束。
 // 结束成功时把在班事项（本班新增与已接收，含结束前已关闭者）冻结为结束时记录；
-// 校验或保存失败时不留下任何记录，班次保持进行中。
+// 校验或保存失败时不留下任何记录，班次保持进行中，也不写入结束时间与结束时
+// 事项记录，原交接的结果、事项归属与已保存的处理经过不受影响。
 func (svc *Service) CloseShift(shiftID string) (Shift, error) {
 	shiftID = clean(shiftID)
 	var result Shift
@@ -378,7 +381,7 @@ func (svc *Service) CloseShift(shiftID string) (Shift, error) {
 		for i := range d.Handovers {
 			h := &d.Handovers[i]
 			if h.ToShiftID == sh.ID && !h.Completed() {
-				return fmt.Errorf("%w：接班交接 %s 仍有未处理或退回事项，班次不能结束",
+				return fmt.Errorf("%w：接班交接 %s 仍有未确认接收的事项，班次不能结束",
 					ErrHandoverState, h.ID)
 			}
 		}

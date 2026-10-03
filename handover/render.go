@@ -106,6 +106,7 @@ func fmtProcessedAtIfRecorded(t *time.Time) string {
 }
 
 // entryCurrentResultLabel 是交接当前结果在事项处理经过查询中的展示名。
+// 缺失、为空或无法识别的结果沿用 Label 的明确提示，不推测成任何一种已知结果。
 func entryCurrentResultLabel(s EntryStatus) string {
 	switch s {
 	case EntryPending:
@@ -117,7 +118,7 @@ func entryCurrentResultLabel(s EntryStatus) string {
 	case EntryTracking:
 		return "继续跟踪（已接收）"
 	}
-	return string(s)
+	return s.Label()
 }
 
 // FormatJourneyEvent 格式化处理经过中的单条记录。交接相关记录带有交接
