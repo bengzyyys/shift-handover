@@ -2171,3 +2171,208 @@ func TestItemJourneyProcessedMissingTime(t *testing.T) {
 		t.Fatalf("真正待处理的事项仍应显示尚未处理：\n%s", text4)
 	}
 }
+
+// legacyProcessedMissingTimeRaw 构造一份旧数据：同一交接中包含已确认缺处理时间、
+// 继续跟踪（处理人缺失且时间零值）、退回（时间零值但退回轮次时间真实）以及真正
+// 待处理四类事项。
+const legacyProcessedMissingTimeRaw = `{
+  "shift_seq": 2, "item_seq": 4, "handover_seq": 1, "note_seq": 0,
+  "shifts": [
+    {"id":"S001","position":"调度","owner":"张三","start":"2026-10-02T08:00:00+08:00","end":"2026-10-02T16:00:00+08:00","created_at":"2026-10-02T08:00:00+08:00","closed":true},
+    {"id":"S002","position":"调度","owner":"李四","start":"2026-10-02T16:00:00+08:00","end":"2026-10-02T23:00:00+08:00","created_at":"2026-10-02T08:00:00+08:00","closed":false}
+  ],
+  "items": [
+    {"id":"I001","origin_shift_id":"S001","shift_ids":["S001"],"current_shift_id":"S001",
+     "content":"已确认缺时间","severity":"normal","follow_owner":"李四",
+     "created_at":"2026-10-02T09:00:00+08:00",
+     "events":[{"at":"2026-10-02T09:00:00+08:00","kind":"created","detail":"事项建立"}]},
+    {"id":"I002","origin_shift_id":"S001","shift_ids":["S001"],"current_shift_id":"S001",
+     "content":"跟踪零值时间","severity":"important","follow_owner":"李四",
+     "created_at":"2026-10-02T09:10:00+08:00",
+     "events":[{"at":"2026-10-02T09:10:00+08:00","kind":"created","detail":"事项建立"}]},
+    {"id":"I003","origin_shift_id":"S001","shift_ids":["S001"],"current_shift_id":"S001",
+     "content":"退回缺时间","severity":"normal","follow_owner":"李四",
+     "created_at":"2026-10-02T09:20:00+08:00",
+     "events":[{"at":"2026-10-02T09:20:00+08:00","kind":"created","detail":"事项建立"}]},
+    {"id":"I004","origin_shift_id":"S001","shift_ids":["S001"],"current_shift_id":"S001",
+     "content":"真正待处理","severity":"normal","follow_owner":"李四",
+     "created_at":"2026-10-02T09:30:00+08:00",
+     "events":[{"at":"2026-10-02T09:30:00+08:00","kind":"created","detail":"事项建立"}]}
+  ],
+  "handovers": [
+    {"id":"H001","position":"调度","from_shift_id":"S001","to_shift_id":"S002",
+     "created_at":"2026-10-02T10:00:00+08:00",
+     "entries":[
+       {"item_id":"I001","content":"已确认缺时间","severity":"normal","follow_owner":"李四",
+        "status":"confirmed","operator":"王五"},
+       {"item_id":"I002","content":"跟踪零值时间","severity":"important","follow_owner":"李四",
+        "status":"tracking","operator":"","processed_at":"0001-01-01T00:00:00Z",
+        "tracking_note":"继续观察","follow_owner":"钱七"},
+       {"item_id":"I003","content":"退回缺时间","severity":"normal","follow_owner":"李四",
+        "status":"returned","operator":"赵六","processed_at":"0001-01-01T00:00:00Z",
+        "rounds":[{"seq":1,"returned_at":"2026-10-02T11:00:00+08:00","return_operator":"赵六","reason":"信息不全"}]},
+       {"item_id":"I004","content":"真正待处理","severity":"normal","follow_owner":"李四",
+        "status":"pending"}
+     ]}
+  ],
+  "notes": []
+}`
+
+// openLegacyService 把原始 JSON 写入临时文件并打开为服务。
+func openLegacyService(t *testing.T, raw string) *Service {
+	t.Helper()
+	dir := t.TempDir()
+	path := filepath.Join(dir, "data.json")
+	if err := os.WriteFile(path, []byte(raw), 0o644); err != nil {
+		t.Fatalf("write legacy: %v", err)
+	}
+	store, err := Open(path)
+	if err != nil {
+		t.Fatalf("open legacy: %v", err)
+	}
+	return NewService(store)
+}
+
+// TestLegacyProcessedMissingTimeInHandoverAndShiftQueries：handover-show 与
+// shift-show（交班班次、接班班次两个视角）对旧数据中已处理但缺处理人或缺/零值
+// 处理时间的事项，必须按已保存的处理结果展示，处理人与处理时间分别独立标为
+// 未记录，不能显示成尚未处理，也不出现公元元年日期；继续跟踪保留原跟踪说明与
+// 当时指定的后续负责人；退回保留原因与退回历史；真正待处理项仍显示尚未处理。
+// 班次报告嵌入的交接清单与末尾结果说明必须一致。
+func TestLegacyProcessedMissingTimeInHandoverAndShiftQueries(t *testing.T) {
+	svc := openLegacyService(t, legacyProcessedMissingTimeRaw)
+
+	wantFacts := []string{
+		// 已确认接收但无处理时间：保留确认结果与原处理人王五，时间未记录。
+		"[确认接收]",
+		"最后处理：处理人=王五；处理时间=未记录",
+		"当前结果：确认接收；处理人=王五；处理时间=未记录",
+		// 继续跟踪：处理人、时间均未记录，跟踪说明与后续负责人沿用原值。
+		"[继续跟踪]",
+		"最后处理：处理人=未记录；处理时间=未记录",
+		"当前结果：继续跟踪；处理人=未记录；处理时间=未记录",
+		"跟踪说明：继续观察",
+		"跟踪后续负责人：钱七",
+		// 退回：仍是退回结果、保留原退回人，当前处理时间未记录；退回历史不丢。
+		"[退回]",
+		"最后处理：处理人=赵六；处理时间=未记录",
+		"当前结果：退回；处理人=赵六；处理时间=未记录",
+		"第1次退回", "信息不全", "赵六",
+		// 真正待处理：仍显示尚未处理。
+		"[待处理]",
+		"最后处理：尚未处理（等待接班人处理）；处理人=尚未处理；处理时间=尚未处理",
+		"当前结果：待处理；处理人=尚未处理；处理时间=尚未处理",
+	}
+	mustNotContain := []string{"0001-01-01", "尚未处理（等待接班人处理）；处理人=王五"}
+
+	h, err := svc.GetHandover("H001")
+	if err != nil {
+		t.Fatalf("get handover: %v", err)
+	}
+	htext := FormatHandover(h)
+	for _, want := range wantFacts {
+		// [待处理]/当前结果 等部分事实只属于报告文本，交接文本里没有“当前结果”行；
+		// 两类文本各自断言共有事实即可。
+		if strings.HasPrefix(want, "当前结果：") {
+			continue
+		}
+		if !strings.Contains(htext, want) {
+			t.Fatalf("handover-show 缺少 %q：\n%s", want, htext)
+		}
+	}
+	for _, bad := range mustNotContain {
+		if strings.Contains(htext, bad) {
+			t.Fatalf("handover-show 不应出现 %q：\n%s", bad, htext)
+		}
+	}
+
+	// 交班班次与接班班次两个视角的报告都应与交接查询得到一致事实。
+	for _, shiftID := range []string{"S001", "S002"} {
+		rep, err := svc.ShiftReport(shiftID)
+		if err != nil {
+			t.Fatalf("report %s: %v", shiftID, err)
+		}
+		rtext := FormatReport(rep)
+		for _, want := range wantFacts {
+			if !strings.Contains(rtext, want) {
+				t.Fatalf("shift-show %s 缺少 %q：\n%s", shiftID, want, rtext)
+			}
+		}
+		for _, bad := range mustNotContain {
+			if strings.Contains(rtext, bad) {
+				t.Fatalf("shift-show %s 不应出现 %q：\n%s", shiftID, bad, rtext)
+			}
+		}
+	}
+}
+
+// TestLegacyReturnedRoundsMissingPeopleAndTime：旧退回历史中缺少退回人/退回时间、
+// 补充人/补充时间或重新提交时间（零值）时，交接查询与班次查询都标为未记录，
+// 不显示公元元年、不以他人代替；已补充重新提交、当前恢复待处理的事项，当前
+// 处理信息显示尚未处理，上一轮退回人与时间仍留在退回历史中（缺失就标未记录）。
+func TestLegacyReturnedRoundsMissingPeopleAndTime(t *testing.T) {
+	raw := `{
+  "shift_seq": 2, "item_seq": 1, "handover_seq": 1, "note_seq": 0,
+  "shifts": [
+    {"id":"S001","position":"调度","owner":"张三","start":"2026-10-02T08:00:00+08:00","end":"2026-10-02T16:00:00+08:00","created_at":"2026-10-02T08:00:00+08:00","closed":true},
+    {"id":"S002","position":"调度","owner":"李四","start":"2026-10-02T16:00:00+08:00","end":"2026-10-02T23:00:00+08:00","created_at":"2026-10-02T08:00:00+08:00","closed":false}
+  ],
+  "items": [
+    {"id":"I001","origin_shift_id":"S001","shift_ids":["S001"],"current_shift_id":"S001",
+     "content":"旧退回事项","severity":"normal","follow_owner":"李四",
+     "created_at":"2026-10-02T09:00:00+08:00",
+     "events":[{"at":"2026-10-02T09:00:00+08:00","kind":"created","detail":"事项建立"}]}
+  ],
+  "handovers": [
+    {"id":"H001","position":"调度","from_shift_id":"S001","to_shift_id":"S002",
+     "created_at":"0001-01-01T00:00:00Z",
+     "entries":[
+       {"item_id":"I001","content":"旧退回事项","severity":"normal","follow_owner":"李四",
+        "status":"pending",
+        "rounds":[{"seq":1,"returned_at":"0001-01-01T00:00:00Z","return_operator":"","reason":"旧退回无时间",
+                   "supplement":"旧补充","supplement_operator":"",
+                   "supplement_at":"0001-01-01T00:00:00Z","resubmitted_at":"0001-01-01T00:00:00Z"}]}
+     ]}
+  ],
+  "notes": []
+}`
+	svc := openLegacyService(t, raw)
+	wantFacts := []string{
+		"[待处理]",
+		"最后处理：尚未处理（等待接班人处理）；处理人=尚未处理；处理时间=尚未处理",
+		"原因=旧退回无时间",
+		"操作人=未记录",
+		"补充说明：旧补充 补充人=未记录 补充时间=未记录",
+		"已重新提交：未记录",
+		// 报告末尾结果区的退回历史格式。
+		"第1次退回：操作人=未记录 时间=未记录 原因=旧退回无时间",
+		"补充：旧补充（补充人=未记录，补充时间=未记录）",
+		"当前结果：待处理；处理人=尚未处理；处理时间=尚未处理",
+	}
+
+	h, err := svc.GetHandover("H001")
+	if err != nil {
+		t.Fatalf("get handover: %v", err)
+	}
+	htext := FormatHandover(h)
+	if !strings.Contains(htext, "第1次退回：未记录 操作人=未记录 原因=旧退回无时间") {
+		t.Fatalf("交接查询退回历史缺时间/缺人应标未记录：\n%s", htext)
+	}
+	if strings.Contains(htext, "0001-01-01") {
+		t.Fatalf("交接查询不应出现公元元年日期：\n%s", htext)
+	}
+
+	rep, err := svc.ShiftReport("S002")
+	if err != nil {
+		t.Fatalf("report: %v", err)
+	}
+	rtext := FormatReport(rep)
+	for _, want := range wantFacts {
+		if !strings.Contains(rtext, want) {
+			t.Fatalf("班次查询缺少 %q：\n%s", want, rtext)
+		}
+	}
+	if strings.Contains(rtext, "0001-01-01") {
+		t.Fatalf("班次查询不应出现公元元年日期：\n%s", rtext)
+	}
+}

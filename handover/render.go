@@ -84,7 +84,16 @@ func fmtTimePtrIfRecorded(t *time.Time) string {
 	if t == nil {
 		return "未记录"
 	}
-	return fmtTime(*t)
+	return fmtTimeIfRecorded(*t)
+}
+
+// fmtTimeIfRecorded 展示时间值，旧数据零值（0001-01-01T00:00:00Z）时
+// 明确标为未记录，不显示公元元年日期。
+func fmtTimeIfRecorded(t time.Time) string {
+	if t.IsZero() {
+		return "未记录"
+	}
+	return fmtTime(t)
 }
 
 // fmtProcessedAtIfRecorded 展示处理时间，缺失（nil）或旧数据零值
@@ -223,10 +232,17 @@ func FormatEntry(e HandoverEntry) string {
 		e.ItemID, e.Status.Label(), e.Severity.Label(), e.FollowOwner)
 	fmt.Fprintf(&b, "  原文：%s\n", e.Content)
 	fmt.Fprintf(&b, "  限制条件：%s\n", dashIfEmpty(e.Constraints))
-	if e.ProcessedAt == nil {
-		b.WriteString("  最后处理：尚未处理（等待接班人处理）\n")
+	// 是否处理过以已保存的处理结果为准，不以处理时间是否保存为准：确认接收、
+	// 继续跟踪与退回都属于已经发生的处理。处理人与处理时间各自独立展示，缺少
+	// 其中一个不能隐藏另一个：人名缺失明确标为未记录，时间缺失或为旧数据零值
+	// （0001-01-01T00:00:00Z）同样标为未记录，不以班次负责人、交接发起时间或
+	// 退回历史中的时间代替；真正待处理（含退回后已补充重新提交、等待接班人再次
+	// 处理）的事项才显示尚未处理。
+	if e.Status == EntryPending {
+		b.WriteString("  最后处理：尚未处理（等待接班人处理）；处理人=尚未处理；处理时间=尚未处理\n")
 	} else {
-		fmt.Fprintf(&b, "  最后处理：操作人=%s 时间=%s\n", dashIfEmpty(e.Operator), fmtTimePtr(e.ProcessedAt))
+		fmt.Fprintf(&b, "  最后处理：处理人=%s；处理时间=%s\n",
+			whoIfRecorded(e.Operator), fmtProcessedAtIfRecorded(e.ProcessedAt))
 	}
 	if e.Status == EntryTracking || e.TrackingNote != "" {
 		fmt.Fprintf(&b, "  跟踪说明：%s\n", dashIfEmpty(e.TrackingNote))
@@ -234,13 +250,15 @@ func FormatEntry(e HandoverEntry) string {
 	}
 	for _, r := range e.Rounds {
 		fmt.Fprintf(&b, "  第%d次退回：%s 操作人=%s 原因=%s\n",
-			r.Seq, fmtTime(r.ReturnedAt), r.ReturnOperator, r.Reason)
+			r.Seq, fmtTimeIfRecorded(r.ReturnedAt),
+			whoIfRecorded(r.ReturnOperator), r.Reason)
 		if r.Supplement != "" {
 			fmt.Fprintf(&b, "    补充说明：%s 补充人=%s 补充时间=%s\n",
-				r.Supplement, dashIfEmpty(r.SupplementOperator), fmtTimePtr(r.SupplementAt))
+				r.Supplement, whoIfRecorded(r.SupplementOperator),
+				fmtTimePtrIfRecorded(r.SupplementAt))
 		}
 		if r.ResubmittedAt != nil {
-			fmt.Fprintf(&b, "    已重新提交：%s\n", fmtTime(*r.ResubmittedAt))
+			fmt.Fprintf(&b, "    已重新提交：%s\n", fmtTimePtrIfRecorded(r.ResubmittedAt))
 		}
 	}
 	return b.String()
@@ -251,10 +269,11 @@ func FormatHandover(h Handover) string {
 	var b strings.Builder
 	state := "未完成"
 	if h.Completed() {
-		state = "已完成 " + fmtTimePtr(h.CompletedAt)
+		state = "已完成 " + fmtTimePtrIfRecorded(h.CompletedAt)
 	}
 	fmt.Fprintf(&b, "%s  岗位=%s  %s -> %s  发起于 %s  [%s]  共%d项\n",
-		h.ID, h.Position, h.FromShiftID, h.ToShiftID, fmtTime(h.CreatedAt), state, len(h.Entries))
+		h.ID, h.Position, h.FromShiftID, h.ToShiftID,
+		fmtTimeIfRecorded(h.CreatedAt), state, len(h.Entries))
 	if len(h.Entries) == 0 {
 		b.WriteString("  （空清单，直接完成）\n")
 	}
@@ -334,22 +353,30 @@ func FormatReport(rep ShiftReport) string {
 	for _, id := range ids {
 		views := rep.Results[id]
 		for _, v := range views {
-			operator, processedAt := dashIfEmpty(v.Entry.Operator), fmtTimePtr(v.Entry.ProcessedAt)
-			if v.Entry.ProcessedAt == nil {
-				operator, processedAt = "尚未处理", "尚未处理"
+			// 是否处理过以已保存的处理结果（状态）为准，与处理时间是否保存
+			// 无关：确认接收、继续跟踪、退回都算已处理。处理人与处理时间
+			// 分别独立展示，缺失的明确标为未记录，不用另一方或退回历史中的
+			// 信息代替；真正待处理（含退回后补充重新提交、等待接班人再次
+			// 处理）的事项才显示尚未处理。
+			operator, processedAt := "尚未处理", "尚未处理"
+			if v.Entry.Status != EntryPending {
+				operator = whoIfRecorded(v.Entry.Operator)
+				processedAt = fmtProcessedAtIfRecorded(v.Entry.ProcessedAt)
 			}
 			fmt.Fprintf(&b, "  事项 %s 交接 %s（%s -> %s）当前结果：%s；处理人=%s；处理时间=%s\n",
 				id, v.HandoverID, v.FromShift, v.ToShift,
 				v.Entry.Status.Label(), operator, processedAt)
 			for _, r := range v.Entry.Rounds {
 				fmt.Fprintf(&b, "    第%d次退回：操作人=%s 时间=%s 原因=%s\n",
-					r.Seq, r.ReturnOperator, fmtTime(r.ReturnedAt), r.Reason)
+					r.Seq, whoIfRecorded(r.ReturnOperator),
+					fmtTimeIfRecorded(r.ReturnedAt), r.Reason)
 				if r.Supplement != "" {
 					fmt.Fprintf(&b, "      补充：%s（补充人=%s，补充时间=%s）\n",
-						r.Supplement, dashIfEmpty(r.SupplementOperator), fmtTimePtr(r.SupplementAt))
+						r.Supplement, whoIfRecorded(r.SupplementOperator),
+						fmtTimePtrIfRecorded(r.SupplementAt))
 				}
 				if r.ResubmittedAt != nil {
-					fmt.Fprintf(&b, "      已重新提交：%s\n", fmtTime(*r.ResubmittedAt))
+					fmt.Fprintf(&b, "      已重新提交：%s\n", fmtTimePtrIfRecorded(r.ResubmittedAt))
 				}
 			}
 		}
