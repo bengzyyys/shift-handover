@@ -437,16 +437,9 @@ func (svc *Service) CreateHandover(fromShiftID, toShiftID string) (Handover, err
 			return fmt.Errorf("%w：班次 %s（%s）不能交给其他岗位 %s（%s）",
 				ErrPositionMismatch, from.ID, from.Position, to.ID, to.Position)
 		}
-		if to.Closed {
-			return fmt.Errorf("%w：接班班次 %s 已结束，不能交接", ErrShiftClosed, to.ID)
-		}
-		if to.Start.Before(from.Start) {
-			return fmt.Errorf("%w：接班班次 %s 开始时间 %s 早于交班班次 %s 开始时间 %s",
-				ErrInvalidInput, to.ID, to.Start.Format(time.RFC3339),
-				from.ID, from.Start.Format(time.RFC3339))
-		}
 
-		// 同一交班班次只能指定一个接班对象。
+		// 同一交班班次只能指定一个接班对象。已有记录时重复发起返回原记录、
+		// 改换对象报错；接班班次此后是否结束都不影响，也不再生成第二条交接。
 		for i := range d.Handovers {
 			if d.Handovers[i].FromShiftID == from.ID {
 				existing := &d.Handovers[i]
@@ -457,6 +450,15 @@ func (svc *Service) CreateHandover(fromShiftID, toShiftID string) (Handover, err
 				}
 				return fmt.Errorf("%w：交接 %s", ErrHandoverExists, existing.ID)
 			}
+		}
+
+		if to.Closed {
+			return fmt.Errorf("%w：接班班次 %s 已结束，不能交接", ErrShiftClosed, to.ID)
+		}
+		if to.Start.Before(from.Start) {
+			return fmt.Errorf("%w：接班班次 %s 开始时间 %s 早于交班班次 %s 开始时间 %s",
+				ErrInvalidInput, to.ID, to.Start.Format(time.RFC3339),
+				from.ID, from.Start.Format(time.RFC3339))
 		}
 
 		if !from.Closed {
