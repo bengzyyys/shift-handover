@@ -298,10 +298,16 @@ func TestHandoverCreationRules(t *testing.T) {
 		// b 未结束，先命中自身校验。
 		t.Fatalf("交给自身应报错，got %v", err)
 	}
-	// 不能交给其他岗位。
+	// 不能交给其他岗位：改用一个从未发起过交接的交班班次 c，首次交接仍按
+	// 岗位不符拒绝（同岗位要求对首次交接保留）。
 	other := mustShift(t, f, "巡检", "赵六", tsDay(2, 16, 0), tsDay(2, 23, 0), "")
-	if _, err := f.svc.CreateHandover(a.ID, other.ID); !errors.Is(err, ErrPositionMismatch) {
-		t.Fatalf("其他岗位应报错，got %v", err)
+	if _, err := f.svc.CreateHandover(c.ID, other.ID); !errors.Is(err, ErrPositionMismatch) {
+		t.Fatalf("首次交接给其他岗位应报错，got %v", err)
+	}
+	// 已有交接记录时改指其他岗位的班次，按改换接班对象拒绝并指出原接班班次，
+	// 不再产生第二条交接（同岗位校验只对首次交接保留）。
+	if _, err := f.svc.CreateHandover(a.ID, other.ID); !errors.Is(err, ErrHandoverTarget) {
+		t.Fatalf("已有交接时改指其他岗位应按改换对象拒绝，got %v", err)
 	}
 	// 接班班次必须尚未结束：用一个没有接班交接的班次 d，先结束再作为接班对象。
 	d := mustShift(t, f, "调度", "钱七", tsDay(3, 8, 0), tsDay(3, 16, 0), "")
@@ -319,6 +325,190 @@ func TestHandoverCreationRules(t *testing.T) {
 	open := mustShift(t, f, "调度", "孙八", tsDay(3, 16, 0), tsDay(4, 0, 0), "")
 	if _, err := f.svc.CreateHandover(c.ID, open.ID); !errors.Is(err, ErrShiftNotClosed) {
 		t.Fatalf("交班班次未结束应报 ErrShiftNotClosed，got %v", err)
+	}
+}
+
+// TestRecreateHandoverAfterToShiftClosed：某次交接全部处理完成、接班班次随后
+// 结束（事项又在后续班次关闭或继续流转）后，用原交班/接班编号重复发起必须视为
+// 成功返回已有记录：原交接编号、两班关系、发起与完成时间、各事项当时的确认/
+// 跟踪结果、处理人、处理时间以及退回与补充经过全部沿用原值，不重新挑选清单、
+// 不重新接收、不移动事项、不追加经过。改换接班对象（无论新对象是否结束）一律
+// 拒绝并指出原接班班次，且不得生成第二条交接；不存在的编号仍然报错。
+func TestRecreateHandoverAfterToShiftClosed(t *testing.T) {
+	f := newFixture(t)
+	a, b, items := prepareHandover(t, f)
+	h1, err := f.svc.CreateHandover(a.ID, b.ID)
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	idA, idB := items[0].ID, items[1].ID
+
+	// 乙先退回、交班人补充后再继续跟踪，保留一轮退回/补充经过；甲确认接收。
+	if _, err := f.svc.ProcessEntry(h1.ID, idB, ActionReturn, "李四", "需要补充细节", "", ""); err != nil {
+		t.Fatalf("return: %v", err)
+	}
+	if _, err := f.svc.ResubmitReturned(h1.ID, idB, "张三", "补充说明如下"); err != nil {
+		t.Fatalf("resubmit: %v", err)
+	}
+	if _, err := f.svc.ProcessEntry(h1.ID, idA, ActionConfirm, "李四", "", "", ""); err != nil {
+		t.Fatalf("confirm: %v", err)
+	}
+	if _, err := f.svc.ProcessEntry(h1.ID, idB, ActionTrack, "李四", "", "继续盯压力", "王五"); err != nil {
+		t.Fatalf("track: %v", err)
+	}
+	h1, _ = f.svc.GetHandover(h1.ID)
+	if !h1.Completed() || h1.CompletedAt == nil {
+		t.Fatalf("全部处理后交接应已完成")
+	}
+	createdAt, completedAt := h1.CreatedAt, *h1.CompletedAt
+
+	// 接班班次结束；事项继续流转到下一班 c，甲在 c 关闭。
+	if _, err := f.svc.CloseShift(b.ID); err != nil {
+		t.Fatalf("close b: %v", err)
+	}
+	c := mustShift(t, f, "调度", "赵六", tsDay(2, 23, 0), tsDay(3, 7, 0), "")
+	h2, err := f.svc.CreateHandover(b.ID, c.ID)
+	if err != nil {
+		t.Fatalf("chain handover: %v", err)
+	}
+	if _, err := f.svc.ProcessEntry(h2.ID, idA, ActionConfirm, "赵六", "", "", ""); err != nil {
+		t.Fatalf("confirm on c: %v", err)
+	}
+	if _, err := f.svc.ProcessEntry(h2.ID, idB, ActionTrack, "赵六", "", "持续跟进", "孙七"); err != nil {
+		t.Fatalf("track on c: %v", err)
+	}
+	if _, err := f.svc.CloseItem(idA, "赵六"); err != nil {
+		t.Fatalf("close item on c: %v", err)
+	}
+
+	snapshot := func() string {
+		raw, err := json.Marshal(f.store.data)
+		if err != nil {
+			t.Fatalf("marshal: %v", err)
+		}
+		return string(raw)
+	}
+	before := snapshot()
+
+	// 用原来的交班、接班编号重复发起：返回原记录（ErrHandoverExists），命令行
+	// 据此视为成功；即使接班班次 b 已结束也不再报“接班班次已结束”。
+	again, err := f.svc.CreateHandover(a.ID, b.ID)
+	if !errors.Is(err, ErrHandoverExists) {
+		t.Fatalf("接班班次结束后重复发起应返回 ErrHandoverExists，got %v", err)
+	}
+	stored, _ := f.svc.GetHandover(h1.ID)
+	if again.ID != h1.ID || again.FromShiftID != a.ID || again.ToShiftID != b.ID {
+		t.Fatalf("应返回原交接 %s 及原两班关系，got %+v", h1.ID, again)
+	}
+	if !again.CreatedAt.Equal(createdAt) || again.CompletedAt == nil || !again.CompletedAt.Equal(completedAt) {
+		t.Fatalf("发起时间与完成时间应沿用原值：created %v->%v completed %v->%v",
+			createdAt, again.CreatedAt, completedAt, again.CompletedAt)
+	}
+	if len(again.Entries) != 2 {
+		t.Fatalf("仍应展示原交接的2项清单，而不是按最新班次重新挑选，got %d", len(again.Entries))
+	}
+	got := map[string]HandoverEntry{}
+	for _, e := range again.Entries {
+		got[e.ItemID] = e
+	}
+	ea, eb := got[idA], got[idB]
+	if ea.Status != EntryConfirmed || ea.Operator != "李四" || ea.ProcessedAt == nil {
+		t.Fatalf("甲的确认结果/处理人/处理时间应沿用原值：%+v", ea)
+	}
+	if eb.Status != EntryTracking || eb.Operator != "李四" || eb.ProcessedAt == nil ||
+		eb.TrackingNote != "继续盯压力" || eb.FollowOwner != "王五" {
+		t.Fatalf("乙的继续跟踪结果应沿用原值：%+v", eb)
+	}
+	if len(eb.Rounds) != 1 {
+		t.Fatalf("退回与补充经过应保留，got %d 轮", len(eb.Rounds))
+	}
+	r := eb.Rounds[0]
+	if r.Reason != "需要补充细节" || r.ReturnOperator != "李四" ||
+		r.Supplement != "补充说明如下" || r.SupplementOperator != "张三" ||
+		r.ResubmittedAt == nil {
+		t.Fatalf("退回原因、补充说明、补充人与重新提交时间应原样保留：%+v", r)
+	}
+	// 返回的记录与存储中的原记录逐项一致。
+	if fmt.Sprintf("%+v", again) != fmt.Sprintf("%+v", stored) {
+		t.Fatalf("返回内容应为保存的完整原记录\nwant %+v\ngot  %+v", stored, again)
+	}
+
+	// 重复返回不改动任何数据：不生成新交接、不移动事项、不追加事件或经过。
+	if after := snapshot(); after != before {
+		t.Fatalf("重复发起不得写入或移动任何数据\nbefore %s\nafter  %s", before, after)
+	}
+	if hs := f.svc.ListHandovers(); len(hs) != 2 {
+		t.Fatalf("不应生成第二条交接，期望仍为2条，got %d", len(hs))
+	}
+
+	// 改换为一个确实存在、但已结束的班次：仍按改换对象拒绝并指出原接班班次，
+	// 不能因为新对象已结束而报“接班班次已结束”，更不能产生第二条交接。
+	d := mustShift(t, f, "调度", "钱七", tsDay(3, 8, 0), tsDay(3, 16, 0), "")
+	if _, err := f.svc.CloseShift(d.ID); err != nil {
+		t.Fatalf("close d: %v", err)
+	}
+	_, err = f.svc.CreateHandover(a.ID, d.ID)
+	if !errors.Is(err, ErrHandoverTarget) || !strings.Contains(err.Error(), b.ID) {
+		t.Fatalf("改换为已结束班次应报 ErrHandoverTarget 并指出原接班班次 %s，got %v", b.ID, err)
+	}
+
+	// 改换为尚未结束的其他班次同样拒绝。
+	open := mustShift(t, f, "调度", "孙八", tsDay(3, 16, 0), tsDay(4, 0, 0), "")
+	if _, err := f.svc.CreateHandover(a.ID, open.ID); !errors.Is(err, ErrHandoverTarget) {
+		t.Fatalf("改换为未结束班次也应报 ErrHandoverTarget，got %v", err)
+	}
+	// 改指其他岗位的现存班次同样按改换对象拒绝（同岗位等要求只对首次交接保留）。
+	otherPos := mustShift(t, f, "巡检", "周九", tsDay(3, 8, 0), tsDay(3, 16, 0), "")
+	if _, err := f.svc.CreateHandover(a.ID, otherPos.ID); !errors.Is(err, ErrHandoverTarget) {
+		t.Fatalf("已有交接时改指其他岗位应按改换对象拒绝，got %v", err)
+	}
+	if hs := f.svc.ListHandovers(); len(hs) != 2 {
+		t.Fatalf("改换对象不得产生第二条交接，got %d 条", len(hs))
+	}
+
+	// 编号错误不能被已有记录掩盖。
+	if _, err := f.svc.CreateHandover(a.ID, "S999"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("接班编号不存在应报 ErrNotFound，got %v", err)
+	}
+	if _, err := f.svc.CreateHandover("S999", b.ID); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("交班编号不存在应报 ErrNotFound，got %v", err)
+	}
+	if _, err := f.svc.CreateHandover("S999", "S998"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("编号均不存在应报 ErrNotFound，got %v", err)
+	}
+	if hs := f.svc.ListHandovers(); len(hs) != 2 {
+		t.Fatalf("报错后交接数量应不变，got %d", len(hs))
+	}
+}
+
+// TestRecreateEmptyHandoverAfterToShiftClosed：发起时即完成的空清单交接，
+// 在接班班次结束后重复发起也应返回原记录与原完成时间。
+func TestRecreateEmptyHandoverAfterToShiftClosed(t *testing.T) {
+	f := newFixture(t)
+	a := mustShift(t, f, "调度", "张三", tsDay(2, 8, 0), tsDay(2, 16, 0), "")
+	b := mustShift(t, f, "调度", "李四", tsDay(2, 16, 0), tsDay(2, 23, 0), "")
+	if _, err := f.svc.CloseShift(a.ID); err != nil {
+		t.Fatalf("close a: %v", err)
+	}
+	h, err := f.svc.CreateHandover(a.ID, b.ID)
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	if len(h.Entries) != 0 || !h.Completed() || h.CompletedAt == nil {
+		t.Fatalf("空清单交接应发起即完成：%+v", h)
+	}
+	completedAt := *h.CompletedAt
+	if _, err := f.svc.CloseShift(b.ID); err != nil {
+		t.Fatalf("close b: %v", err)
+	}
+
+	again, err := f.svc.CreateHandover(a.ID, b.ID)
+	if !errors.Is(err, ErrHandoverExists) {
+		t.Fatalf("空清单交接在接班班次结束后重复发起应返回原记录，got %v", err)
+	}
+	if again.ID != h.ID || len(again.Entries) != 0 ||
+		again.CompletedAt == nil || !again.CompletedAt.Equal(completedAt) {
+		t.Fatalf("应返回原空清单交接与原完成时间：%+v", again)
 	}
 }
 

@@ -415,7 +415,12 @@ func (svc *Service) CloseShift(shiftID string) (Shift, error) {
 }
 
 // CreateHandover 由交班班次向同岗位接班班次发起交接。
-// 重复向同一接班班次发起返回已有记录；改换接班对象报错。
+// 重复向同一接班班次发起返回已有记录（ErrHandoverExists）；该承诺在接班班次
+// 随后结束、事项已在后续班次关闭或继续流转后仍然成立，返回保存的原交接内容，
+// 不重新挑选清单、不重新接收或移动事项、不追加经过。改换接班对象报
+// ErrHandoverTarget 并指出原接班班次，无论新对象是否结束都不产生第二条交接。
+// 不存在的班次编号与交给自身始终按各自错误拒绝；同岗位及接班班次尚未结束等
+// 要求仅对首次发起生效。
 func (svc *Service) CreateHandover(fromShiftID, toShiftID string) (Handover, error) {
 	fromShiftID = clean(fromShiftID)
 	toShiftID = clean(toShiftID)
@@ -433,20 +438,12 @@ func (svc *Service) CreateHandover(fromShiftID, toShiftID string) (Handover, err
 		if from.ID == to.ID {
 			return fmt.Errorf("%w：交班班次与接班班次不能都是 %s", ErrSameShift, from.ID)
 		}
-		if from.Position != to.Position {
-			return fmt.Errorf("%w：班次 %s（%s）不能交给其他岗位 %s（%s）",
-				ErrPositionMismatch, from.ID, from.Position, to.ID, to.Position)
-		}
-		if to.Closed {
-			return fmt.Errorf("%w：接班班次 %s 已结束，不能交接", ErrShiftClosed, to.ID)
-		}
-		if to.Start.Before(from.Start) {
-			return fmt.Errorf("%w：接班班次 %s 开始时间 %s 早于交班班次 %s 开始时间 %s",
-				ErrInvalidInput, to.ID, to.Start.Format(time.RFC3339),
-				from.ID, from.Start.Format(time.RFC3339))
-		}
-
-		// 同一交班班次只能指定一个接班对象。
+		// 同一交班班次只能指定一个接班对象。重复发起（包括接班班次随后已
+		// 结束、事项已在后续班次关闭或继续流转的情况）一律返回保存的原记录，
+		// 不重新接收事项、不追加经过；改换为另一个确实存在的接班对象（无论其
+		// 是否结束、是否同岗位）都按改换对象报错并指出原接班班次，且不能生成
+		// 第二条交接。该判定先于同岗位、接班班次状态等首次发起校验；编号不
+		// 存在与交给自身的校验仍在其前。
 		for i := range d.Handovers {
 			if d.Handovers[i].FromShiftID == from.ID {
 				existing := &d.Handovers[i]
@@ -459,6 +456,21 @@ func (svc *Service) CreateHandover(fromShiftID, toShiftID string) (Handover, err
 			}
 		}
 
+		if from.Position != to.Position {
+			return fmt.Errorf("%w：班次 %s（%s）不能交给其他岗位 %s（%s）",
+				ErrPositionMismatch, from.ID, from.Position, to.ID, to.Position)
+		}
+
+		// 以下为首次发起的要求：接班班次尚未结束、开始时间不早于交班班次、
+		// 交班班次已经结束，重叠区间须有说明。
+		if to.Closed {
+			return fmt.Errorf("%w：接班班次 %s 已结束，不能交接", ErrShiftClosed, to.ID)
+		}
+		if to.Start.Before(from.Start) {
+			return fmt.Errorf("%w：接班班次 %s 开始时间 %s 早于交班班次 %s 开始时间 %s",
+				ErrInvalidInput, to.ID, to.Start.Format(time.RFC3339),
+				from.ID, from.Start.Format(time.RFC3339))
+		}
 		if !from.Closed {
 			return fmt.Errorf("%w：交班班次 %s 尚未结束，结束班次后未关闭事项才成为交接清单",
 				ErrShiftNotClosed, from.ID)
