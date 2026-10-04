@@ -251,6 +251,11 @@ type JourneyEvent struct {
 	SupplementAt       *time.Time // 补充时间
 	TrackingNote       string     // 继续跟踪的跟踪说明
 	FollowOwner        string     // 继续跟踪当时指定的后续负责人（不随后续修改改变）
+	// ReturnHistoryIncomplete 表示当前保存的结果明确是退回、却没有任何退回轮次
+	// 记录（旧数据缺失）。此时处理经过只补出“该次交接当前已退回”这一条事实，
+	// 处理人与处理时间取自该项当前保存的信息，退回原因与轮次详情明确标为未记录：
+	// 不编造第几次退回、退回原因、补充说明或重新提交经过，也不用事项内容代替原因。
+	ReturnHistoryIncomplete bool
 }
 
 // ItemJourney 是凭事项编号查询得到的完整处理经过：开头为事项最新状态，

@@ -170,6 +170,13 @@ func FormatJourneyEvent(ev JourneyEvent) string {
 		// 交接发起不记录操作人，始终显示未记录，不以班次负责人代替。
 		return fmt.Sprintf("%s %s发起交接 操作人=%s", when, where, who)
 	case "return":
+		if ev.ReturnHistoryIncomplete {
+			// 当前结果明确是退回却没有任何退回轮次记录：只陈述“该次交接当前
+			// 已退回”这一事实并提示退回历史不完整。不编造第几次退回，原因
+			// 明确标为未记录，也不用事项内容代替原因。
+			return fmt.Sprintf("%s %s退回（退回历史不完整：缺少退回轮次记录，退回原因未记录）操作人=%s 原因=未记录",
+				when, where, who)
+		}
 		return fmt.Sprintf("%s %s第%d次退回 操作人=%s 原因=%s",
 			when, where, ev.RoundSeq, who, ev.Reason)
 	case "resubmit":

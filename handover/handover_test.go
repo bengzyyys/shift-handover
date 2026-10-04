@@ -3027,3 +3027,231 @@ func TestNormalCompletionTimeStable(t *testing.T) {
 		t.Fatalf("正常完成时间应保持 18:00 不变，got %v", got.CompletedAt)
 	}
 }
+
+// TestItemJourneyReturnedWithoutRounds：交接事项当前保存的结果明确是退回，却没有
+// 任何退回轮次记录（旧数据缺失）时，item-show 的处理经过也要呈现该次交接当前已
+// 退回的事实，并明确提示“退回历史不完整”，让用户区分没有发生退回与已退回但详情
+// 没有留下。处理人与时间各自使用该项当前保存的信息；原因未记录，不编造轮次、补充
+// 或重新提交经过。查询只读；对这类事项补充并重新提交仍明确报错。
+func TestItemJourneyReturnedWithoutRounds(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "data.json")
+	raw := `{
+  "shift_seq": 2, "item_seq": 7, "handover_seq": 1, "note_seq": 0,
+  "shifts": [
+    {"id":"S001","position":"调度","owner":"张三","start":"2026-10-02T08:00:00+08:00","end":"2026-10-02T16:00:00+08:00","created_at":"2026-10-02T08:00:00+08:00","closed":true},
+    {"id":"S002","position":"调度","owner":"李四","start":"2026-10-02T16:00:00+08:00","end":"2026-10-02T23:00:00+08:00","created_at":"2026-10-02T08:00:00+08:00","closed":false}
+  ],
+  "items": [
+    {"id":"I001","origin_shift_id":"S001","shift_ids":["S001"],"current_shift_id":"S001",
+     "content":"退回无轮次有时间","severity":"normal","follow_owner":"李四",
+     "created_at":"2026-10-02T09:00:00+08:00",
+     "events":[{"at":"2026-10-02T09:00:00+08:00","kind":"created","detail":"事项建立"}]},
+    {"id":"I002","origin_shift_id":"S001","shift_ids":["S001"],"current_shift_id":"S001",
+     "content":"退回无轮次无姓名无时间","severity":"normal","follow_owner":"李四",
+     "created_at":"2026-10-02T09:10:00+08:00",
+     "events":[{"at":"2026-10-02T09:10:00+08:00","kind":"created","detail":"事项建立"}]},
+    {"id":"I003","origin_shift_id":"S001","shift_ids":["S001"],"current_shift_id":"S001",
+     "content":"退回无轮次零值时间","severity":"normal","follow_owner":"李四",
+     "created_at":"2026-10-02T09:20:00+08:00",
+     "events":[{"at":"2026-10-02T09:20:00+08:00","kind":"created","detail":"事项建立"}]},
+    {"id":"I004","origin_shift_id":"S001","shift_ids":["S001"],"current_shift_id":"S001",
+     "content":"待处理残留姓名时间","severity":"normal","follow_owner":"李四",
+     "created_at":"2026-10-02T09:30:00+08:00",
+     "events":[{"at":"2026-10-02T09:30:00+08:00","kind":"created","detail":"事项建立"}]},
+    {"id":"I005","origin_shift_id":"S001","shift_ids":["S001"],"current_shift_id":"S001",
+     "content":"结果缺失残留姓名","severity":"normal","follow_owner":"李四",
+     "created_at":"2026-10-02T09:40:00+08:00",
+     "events":[{"at":"2026-10-02T09:40:00+08:00","kind":"created","detail":"事项建立"}]},
+    {"id":"I006","origin_shift_id":"S001","shift_ids":["S001"],"current_shift_id":"S001",
+     "content":"结果无法识别残留时间","severity":"normal","follow_owner":"李四",
+     "created_at":"2026-10-02T09:50:00+08:00",
+     "events":[{"at":"2026-10-02T09:50:00+08:00","kind":"created","detail":"事项建立"}]},
+    {"id":"I007","origin_shift_id":"S001","shift_ids":["S001"],"current_shift_id":"S001",
+     "content":"已有退回轮次","severity":"normal","follow_owner":"李四",
+     "created_at":"2026-10-02T10:10:00+08:00",
+     "events":[{"at":"2026-10-02T10:10:00+08:00","kind":"created","detail":"事项建立"}]}
+  ],
+  "handovers": [
+    {"id":"H001","position":"调度","from_shift_id":"S001","to_shift_id":"S002",
+     "created_at":"2026-10-02T10:00:00+08:00",
+     "entries":[
+       {"item_id":"I001","content":"退回无轮次有时间","severity":"normal","follow_owner":"李四",
+        "status":"returned","operator":"李四","processed_at":"2026-10-02T11:00:00+09:00"},
+       {"item_id":"I002","content":"退回无轮次无姓名无时间","severity":"normal","follow_owner":"李四",
+        "status":"returned"},
+       {"item_id":"I003","content":"退回无轮次零值时间","severity":"normal","follow_owner":"李四",
+        "status":"returned","operator":"赵六","processed_at":"0001-01-01T00:00:00Z"},
+       {"item_id":"I004","content":"待处理残留姓名时间","severity":"normal","follow_owner":"李四",
+        "status":"pending","operator":"钱七","processed_at":"2026-10-02T12:00:00+08:00"},
+       {"item_id":"I005","content":"结果缺失残留姓名","severity":"normal","follow_owner":"李四",
+        "status":"","operator":"孙八"},
+       {"item_id":"I006","content":"结果无法识别残留时间","severity":"normal","follow_owner":"李四",
+        "status":"mystery","processed_at":"2026-10-02T12:30:00+08:00"},
+       {"item_id":"I007","content":"已有退回轮次","severity":"normal","follow_owner":"李四",
+        "status":"returned","operator":"李四","processed_at":"2026-10-02T13:00:00+08:00",
+        "rounds":[{"seq":1,"returned_at":"2026-10-02T13:00:00+08:00","return_operator":"李四","reason":"缺少图纸"}]}
+     ]}
+  ],
+  "notes": []
+}`
+	if err := os.WriteFile(path, []byte(raw), 0o644); err != nil {
+		t.Fatalf("write legacy: %v", err)
+	}
+	store, err := Open(path)
+	if err != nil {
+		t.Fatalf("open legacy: %v", err)
+	}
+	svc := NewService(store)
+
+	// I001：有真实处理时间与处理人，补出的退回经过按实际时刻进入时间线；
+	// 11:00+09:00 与发起时间 10:00+08:00 是同一实际时刻，仍保持发起在前、
+	// 退回在后；展示保留原时区。
+	j1, err := svc.ItemJourney("I001")
+	if err != nil {
+		t.Fatalf("journey I001: %v", err)
+	}
+	if got := journeyKinds(j1); joinStrings(got) != "created,handover-init,return" {
+		t.Fatalf("无轮次退回也应出现在处理经过中：%v", got)
+	}
+	rev := j1.Events[2]
+	if !rev.TimeKnown || !rev.ReturnHistoryIncomplete || rev.Operator != "李四" {
+		t.Fatalf("补出的退回经过应带真实时间与当前保存的处理人：%+v", rev)
+	}
+	initAt := j1.Events[1].At
+	if !rev.At.Equal(initAt) {
+		t.Fatalf("11:00+09:00 与 10:00+08:00 应为同一实际时刻：%v vs %v", rev.At, initAt)
+	}
+	if rev.HandoverID != "H001" || rev.FromShift != "S001" || rev.ToShift != "S002" {
+		t.Fatalf("退回经过应带出原交接编号与交班、接班班次：%+v", rev)
+	}
+	text1 := FormatItemJourney(j1)
+	for _, want := range []string{
+		"退回（退回历史不完整：缺少退回轮次记录，退回原因未记录）",
+		"操作人=李四", "原因=未记录", "11:00:00 +09:00",
+		"当前结果：退回（等待交班人补充）",
+	} {
+		if !strings.Contains(text1, want) {
+			t.Fatalf("I001 展示缺少 %q：\n%s", want, text1)
+		}
+	}
+	for _, banned := range []string{"第1次退回", "重新提交", "补充说明", "退回无轮次有时间）", "0001-01-01"} {
+		if strings.Contains(text1, banned) {
+			t.Fatalf("I001 展示不应出现 %q：\n%s", banned, text1)
+		}
+	}
+	// 不能用事项内容代替退回原因。
+	for _, line := range strings.Split(text1, "\n") {
+		if strings.Contains(line, "退回历史不完整") && strings.Contains(line, "退回无轮次有时间") {
+			t.Fatalf("退回原因未记录时不能用事项内容代替：\n%s", line)
+		}
+	}
+
+	// I002：处理人与处理时间都缺失，各自标为未记录，缺一个不隐藏另一个；
+	// 无真实时间的退回排在有真实时间的发起之后。
+	j2, err := svc.ItemJourney("I002")
+	if err != nil {
+		t.Fatalf("journey I002: %v", err)
+	}
+	if got := journeyKinds(j2); joinStrings(got) != "created,handover-init,return" {
+		t.Fatalf("I002 经过顺序不正确：%v", got)
+	}
+	if j2.Events[2].TimeKnown || j2.Events[2].Operator != "" {
+		t.Fatalf("无姓名无时间的补出退回应保留未记录标记：%+v", j2.Events[2])
+	}
+	text2 := FormatItemJourney(j2)
+	if !strings.Contains(text2, "未记录 交接 H001（S001 -> S002）退回（退回历史不完整") ||
+		!strings.Contains(text2, "操作人=未记录 原因=未记录") {
+		t.Fatalf("I002 应明确显示处理人与原因均未记录：\n%s", text2)
+	}
+
+	// I003：零值处理时间视为未记录，但处理人赵六仍展示，不能拿发起时间补齐。
+	j3, err := svc.ItemJourney("I003")
+	if err != nil {
+		t.Fatalf("journey I003: %v", err)
+	}
+	if j3.Events[2].TimeKnown {
+		t.Fatalf("零值处理时间应视为未记录：%+v", j3.Events[2])
+	}
+	text3 := FormatItemJourney(j3)
+	if !strings.Contains(text3, "退回历史不完整") || !strings.Contains(text3, "操作人=赵六") {
+		t.Fatalf("I003 时间未记录不能隐藏处理人：\n%s", text3)
+	}
+	if strings.Contains(text3, "10:00:00 +08:00") && strings.Contains(strings.SplitN(text3, "退回历史不完整", 2)[1], "10:00:00 +08:00") {
+		t.Fatalf("不能用交接发起时间补齐退回时间：\n%s", text3)
+	}
+
+	// I004/I005/I006：待处理、结果缺失、无法识别时即使残留姓名或时间，
+	// 也不能认定发生了退回。
+	for _, id := range []string{"I004", "I005", "I006"} {
+		jx, err := svc.ItemJourney(id)
+		if err != nil {
+			t.Fatalf("journey %s: %v", id, err)
+		}
+		if got := journeyKinds(jx); joinStrings(got) != "created,handover-init" {
+			t.Fatalf("%s 不能仅凭残留姓名/时间补出退回：%v", id, got)
+		}
+		if strings.Contains(FormatItemJourney(jx), "退回历史不完整") {
+			t.Fatalf("%s 不是退回，不应提示退回历史不完整", id)
+		}
+	}
+
+	// I007：已有退回轮次的事项继续展示逐轮退回，不因当前结果仍为退回而
+	// 再增加一条相同的处理记录。
+	j7, err := svc.ItemJourney("I007")
+	if err != nil {
+		t.Fatalf("journey I007: %v", err)
+	}
+	returns := 0
+	for _, ev := range j7.Events {
+		if ev.Kind == "return" {
+			returns++
+			if ev.ReturnHistoryIncomplete {
+				t.Fatalf("已有轮次的退回不应标记为历史不完整：%+v", ev)
+			}
+		}
+	}
+	if returns != 1 {
+		t.Fatalf("已有轮次时应只有原来的逐轮退回一条记录，got %d", returns)
+	}
+	text7 := FormatItemJourney(j7)
+	if !strings.Contains(text7, "第1次退回 操作人=李四 原因=缺少图纸") ||
+		strings.Contains(text7, "退回历史不完整") {
+		t.Fatalf("I007 应维持原有逐轮退回展示：\n%s", text7)
+	}
+
+	// 查询只读：重新打开后记录原样，仍没有退回轮次；对这类事项补充并重新提交
+	// 仍按现有规则明确报错，不能把查询时的提示当作已补齐的退回记录。
+	store2, err := Open(path)
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	svc2 := NewService(store2)
+	h, _ := svc2.GetHandover("H001")
+	var e1 *HandoverEntry
+	for i := range h.Entries {
+		if h.Entries[i].ItemID == "I001" {
+			e1 = &h.Entries[i]
+		}
+	}
+	if e1 == nil || e1.Status != EntryReturned || len(e1.Rounds) != 0 {
+		t.Fatalf("查询不应写入退回轮次或改变当前结果：%+v", e1)
+	}
+	it1, _ := svc2.GetItem("I001")
+	if it1.CurrentShiftID != "S001" {
+		t.Fatalf("查询不应改变事项归属：%s", it1.CurrentShiftID)
+	}
+	if _, err := svc2.ResubmitReturned("H001", "I001", "张三", "后补说明"); !errors.Is(err, ErrHandoverState) {
+		t.Fatalf("缺少退回轮次时重新提交仍应报状态错误，got %v", err)
+	}
+	h2, _ := svc2.GetHandover("H001")
+	var e1b *HandoverEntry
+	for i := range h2.Entries {
+		if h2.Entries[i].ItemID == "I001" {
+			e1b = &h2.Entries[i]
+		}
+	}
+	if len(e1b.Rounds) != 0 {
+		t.Fatalf("失败的重新提交不能补写退回记录：%+v", e1b)
+	}
+}
