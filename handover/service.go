@@ -524,6 +524,9 @@ func (svc *Service) CreateHandover(fromShiftID, toShiftID string) (Handover, err
 // action 为 confirm（确认接收）、return（退回，须填原因）或 track（继续跟踪，须填跟踪说明和后续负责人）。
 // 已退回项表示等待交班人补充，只有在原交接记录上成功重新提交、恢复待处理后才能再次
 // 确认、继续跟踪或退回；未重新提交前直接处理一律返回状态错误，且不改变任何数据。
+// 一次成功处理使整份交接变为完成时，完成时间取本次成功处理时刻；即使记录里已有更早
+// 的旧完成时间（旧数据中清单曾有结果缺失或无法识别事项）也以本次时刻为准，只改整份
+// 交接的完成时间，不重写各单项已保存的结果、处理经过与退回/补充历史。
 func (svc *Service) ProcessEntry(handoverID, itemID string, action EntryAction, operator, reason, trackingNote, nextFollowOwner string) (Handover, error) {
 	handoverID = clean(handoverID)
 	itemID = clean(itemID)
@@ -611,7 +614,15 @@ func (svc *Service) ProcessEntry(handoverID, itemID string, action EntryAction, 
 			}
 		}
 
-		if h.Completed() && h.CompletedAt == nil {
+		// 本次成功处理后整份交接首次（或在结果缺失、无法识别等不确定项补齐后
+		// 再次）变为完成时，完成时间一律取这次成功处理的时刻：记录里原先保存的
+		// 旧完成时间可能早于补齐结果（使查询看起来像在补齐前就完成了交接），
+		// 必须以最后一项真正接收的时刻为准；nil 或旧数据零值
+		// （0001-01-01T00:00:00Z）同样按本次实际完成的操作记录。这里只改整份
+		// 交接的完成时间，不重写任何单项的结果、处理人、处理时间与退回/补充历史。
+		// 能走到这里的成功处理此前不可能已完成（已接收项不能重复处理），因此不会
+		// 改动正常完成交接的原时间；纯查询不经过本方法，也不会凭空补时间。
+		if h.Completed() {
 			h.CompletedAt = &now
 		}
 		result = *h
