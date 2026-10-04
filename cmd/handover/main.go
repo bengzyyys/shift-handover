@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/bengzyyys/shift-handover/handover"
@@ -61,14 +62,16 @@ const usageText = `用法：handover [--data 文件] <命令> [参数]
 func run(argv []string, stdout, stderr io.Writer) int {
 	args := append([]string(nil), argv...)
 	dataPath := os.Getenv("HANDOVER_DATA")
-	// 抽出全局 --data。
+	// 抽出全局 --data。--data 可能恰为 --content、--constraints 等参数的值，
+	// 此时它属于事项正文或限制条件，不能当作数据文件参数取走；只有前一个
+	// token 不是“需要值的参数”时，--data 才是数据文件参数。
 	rest := make([]string, 0, len(args))
 	for i := 0; i < len(args); i++ {
 		switch {
-		case args[i] == "--data" && i+1 < len(args):
+		case args[i] == "--data" && i+1 < len(args) && !prevTakesValue(args, i):
 			dataPath = args[i+1]
 			i++
-		case len(args[i]) > 7 && args[i][:7] == "--data=":
+		case len(args[i]) > 7 && args[i][:7] == "--data=" && !prevTakesValue(args, i):
 			dataPath = args[i][7:]
 		default:
 			rest = append(rest, args[i])
@@ -103,6 +106,50 @@ func run(argv []string, stdout, stderr io.Writer) int {
 		}
 	}
 	return 0
+}
+
+// valueFlags 列出命令行中接受一个值的参数；这些参数后面的 token 是其值，
+// 即使写法与全局 --data 相同也不能当作数据文件参数。布尔参数不在其中。
+var valueFlags = map[string]bool{
+	"--data":        true,
+	"--id":          true,
+	"--position":    true,
+	"--owner":       true,
+	"--start":       true,
+	"--end":         true,
+	"--note":        true,
+	"--a":           true,
+	"--b":           true,
+	"--shift":       true,
+	"--content":     true,
+	"--severity":    true,
+	"--constraints": true,
+	"--follow":      true,
+	"--operator":    true,
+	"--from":        true,
+	"--to":          true,
+	"--item":        true,
+	"--action":      true,
+	"--reason":      true,
+	"--supplement":  true,
+}
+
+// prevTakesValue 判断 args[i] 是否紧跟在一个需要值的参数后面（且该参数自身
+// 没有以 --name=值 的形式给出值）。是则说明 args[i] 是该参数的值，不得
+// 作为全局 --data 抽出。
+func prevTakesValue(args []string, i int) bool {
+	if i == 0 {
+		return false
+	}
+	prev := args[i-1]
+	if !strings.HasPrefix(prev, "--") {
+		return false
+	}
+	// --name=value 形式的前一个参数自带值，不会再占用当前 token。
+	if strings.ContainsRune(prev, '=') {
+		return false
+	}
+	return valueFlags[prev]
 }
 
 func dispatch(svc *handover.Service, cmd string, args []string) (string, error) {
