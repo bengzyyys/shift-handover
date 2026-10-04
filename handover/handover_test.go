@@ -3027,3 +3027,344 @@ func TestNormalCompletionTimeStable(t *testing.T) {
 		t.Fatalf("正常完成时间应保持 18:00 不变，got %v", got.CompletedAt)
 	}
 }
+
+// blockSaveOnce 在数据文件的临时写入路径放置一个同名目录，使下一次 commit 的
+// os.WriteFile 必然失败（EISDIR）。这是真正进入保存过程之后的写盘失败：业务
+// 校验已全部通过，只是落盘动作本身失败；不依赖文件权限或运行身份，对 root 也
+// 稳定生效。原数据文件不会被改动（改名阶段根本到不了）。返回清理函数。
+func blockSaveOnce(t *testing.T, f *fixture) func() {
+	t.Helper()
+	tmp := f.store.Path() + ".tmp"
+	if err := os.Mkdir(tmp, 0o755); err != nil {
+		t.Fatalf("制造写盘失败（临时路径建目录）：%v", err)
+	}
+	return func() { _ = os.RemoveAll(tmp) }
+}
+
+// assertDataFileUntouched 断言磁盘上的数据文件与保存失败前逐字节一致。
+func assertDataFileUntouched(t *testing.T, path, want string) {
+	t.Helper()
+	b, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("读取数据文件：%v", err)
+	}
+	if string(b) != want {
+		t.Fatalf("写盘失败不得改动失败前已保存的数据文件\nwant %s\ngot  %s", want, string(b))
+	}
+}
+
+// TestTrackLastItemSaveFailureLeavesNothingPartial：接班人对交接中最后一项
+// 待处理事项选择继续跟踪，参数合法、状态允许、已真正进入保存过程，但本地写盘
+// 失败。必须明确返回保存错误，并且不留下任何半完成结果：
+//   - 当前打开的数据里：最后一项仍待处理、当前处理人与处理时间仍显示尚未处理，
+//     没有本次跟踪说明或新负责人，事项仍留在交班班次，流经班次与处理经过不增加
+//     本次接收；整份交接仍未完成、无完成时间；已接收的其他事项及其处理信息原样；
+//   - 失败前已保存的数据（磁盘与重新打开后看到的交接进度、事项班次、负责人、
+//     交班班次结束时记录）一律保持原样；
+//   - 保存恢复后对同一项再次继续跟踪，按现有功能成功接收：保留事项编号、进入
+//     接班班次、采用本次跟踪说明与负责人、记录本次处理人与处理时间、完成时间以
+//     本次成功处理为准，处理经过只留下成功的这一次接收，失败尝试不成为历史。
+func TestTrackLastItemSaveFailureLeavesNothingPartial(t *testing.T) {
+	f := newFixture(t)
+
+	// 交班班次 S001：两项未关闭事项；其中一项随后被成功接收，另一项是最后一项
+	// 待处理事项，仍属于交班班次。
+	a := mustShift(t, f, "调度", "张三", tsDay(2, 8, 0), tsDay(2, 16, 0), "")
+	b := mustShift(t, f, "调度", "李四", tsDay(2, 16, 0), tsDay(2, 23, 0), "")
+	itDone, err := f.svc.AddItem(a.ID, "已接收事项", SeverityNormal, "已有限制", "李四")
+	if err != nil {
+		t.Fatalf("add done item: %v", err)
+	}
+	itLast, err := f.svc.AddItem(a.ID, "最后待办事项", SeverityImportant, "夜间禁动", "李四")
+	if err != nil {
+		t.Fatalf("add last item: %v", err)
+	}
+	// 结束交班班次，冻结结束时记录（两项均未关闭、负责人均为李四）。
+	if _, err := f.svc.CloseShift(a.ID); err != nil {
+		t.Fatalf("close a: %v", err)
+	}
+	h, err := f.svc.CreateHandover(a.ID, b.ID)
+	if err != nil {
+		t.Fatalf("create handover: %v", err)
+	}
+	// 前一项成功确认接收；它的处理信息随后必须原样保留。
+	confirmAt := tsDay(2, 17, 0)
+	f.svc.nowAt(func() time.Time { return confirmAt })
+	if _, err := f.svc.ProcessEntry(h.ID, itDone.ID, ActionConfirm, "李四", "", "", ""); err != nil {
+		t.Fatalf("confirm done item: %v", err)
+	}
+
+	// 记录失败前的完整磁盘快照与交班班次结束时记录，供失败后逐字节/逐项比对。
+	savedBytes, err := os.ReadFile(f.store.Path())
+	if err != nil {
+		t.Fatalf("read saved file: %v", err)
+	}
+	savedBefore := string(savedBytes)
+	raBefore, err := f.svc.ShiftReport(a.ID)
+	if err != nil {
+		t.Fatalf("report a before: %v", err)
+	}
+	snapBefore := findCloseItem(raBefore, itLast.ID)
+	if snapBefore == nil {
+		t.Fatalf("失败前交班班次结束时记录应包含最后一项")
+	}
+
+	// 制造一次真正的写盘失败（业务校验全部合法：操作人、跟踪说明、与原值不同的
+	// 后续负责人都有效；事项为待处理，状态允许）。
+	failAt := tsDay(2, 18, 0)
+	f.svc.nowAt(func() time.Time { return failAt })
+	unblock := blockSaveOnce(t, f)
+	_, procErr := f.svc.ProcessEntry(h.ID, itLast.ID, ActionTrack, "李四", "", "每两小时记录一次压力", "王五")
+	unblock()
+	if procErr == nil {
+		t.Fatalf("本地写盘失败时操作必须明确返回保存错误")
+	}
+	// commit 的两类落盘失败信息：“写入数据文件失败”（写临时文件）与
+	// “保存数据文件失败”（原子改名），都属于明确的本地保存错误。
+	if !strings.Contains(procErr.Error(), "数据文件失败") {
+		t.Fatalf("应明确返回保存错误，got %v", procErr)
+	}
+	// 失败必须来自保存阶段，而不是缺少跟踪说明、负责人为空或事项已接收等业务拒绝。
+	if errors.Is(procErr, ErrInvalidInput) || errors.Is(procErr, ErrHandoverState) ||
+		errors.Is(procErr, ErrNotFound) {
+		t.Fatalf("要保障的是进入保存后的写盘失败，不能由业务拒绝代替，got %v", procErr)
+	}
+
+	// ---- 当前打开的数据：交接、事项、班次均无半完成结果 ----
+	got, err := f.svc.GetHandover(h.ID)
+	if err != nil {
+		t.Fatalf("get handover after fail: %v", err)
+	}
+	if got.Completed() || got.CompletedAt != nil {
+		t.Fatalf("写盘失败后整份交接应继续显示未完成，且不能留下本次完成时间：%+v", got)
+	}
+	eLast := findEntryOf(t, got, itLast.ID)
+	if eLast.Status != EntryPending {
+		t.Fatalf("最后一项应仍为待处理，got %s", eLast.Status)
+	}
+	if eLast.Operator != "" || eLast.ProcessedAt != nil {
+		t.Fatalf("当前处理人与处理时间应仍显示尚未处理：%+v", eLast)
+	}
+	if eLast.TrackingNote != "" {
+		t.Fatalf("不得留下本次跟踪说明：%+v", eLast)
+	}
+	if eLast.FollowOwner != "李四" {
+		t.Fatalf("不得写入新负责人，应仍为原值李四，got %s", eLast.FollowOwner)
+	}
+	if len(eLast.Rounds) != 0 {
+		t.Fatalf("继续跟踪失败不应产生退回/补充轮次：%+v", eLast.Rounds)
+	}
+	// 已接收的其他事项及其处理信息保持原样。
+	eDone := findEntryOf(t, got, itDone.ID)
+	if eDone.Status != EntryConfirmed || eDone.Operator != "李四" ||
+		eDone.ProcessedAt == nil || !eDone.ProcessedAt.Equal(confirmAt) {
+		t.Fatalf("之前已接收事项及其处理信息应保持原样：%+v", eDone)
+	}
+
+	// 事项仍留在交班班次，流经班次与后续负责人不变。
+	it, err := f.svc.GetItem(itLast.ID)
+	if err != nil {
+		t.Fatalf("get item after fail: %v", err)
+	}
+	if it.CurrentShiftID != a.ID {
+		t.Fatalf("事项应仍留在交班班次 %s，got %s", a.ID, it.CurrentShiftID)
+	}
+	if len(it.ShiftIDs) != 1 || it.ShiftIDs[0] != a.ID {
+		t.Fatalf("流经班次不应增加本次接收：%+v", it.ShiftIDs)
+	}
+	if it.FollowOwner != "李四" {
+		t.Fatalf("事项后续负责人不应被改写，got %s", it.FollowOwner)
+	}
+	// 处理经过不增加这次接收：没有 received 事件，也没有本次操作人与跟踪说明。
+	for _, ev := range it.Events {
+		if ev.Kind == "received" {
+			t.Fatalf("处理经过不应增加本次接收：%+v", ev)
+		}
+		if ev.At.Equal(failAt) {
+			t.Fatalf("失败尝试不应留下失败时刻 %v 的任何事件：%+v", failAt, ev)
+		}
+	}
+
+	// 事项处理经过视图同样不含失败这次“继续跟踪”。
+	j, err := f.svc.ItemJourney(itLast.ID)
+	if err != nil {
+		t.Fatalf("journey after fail: %v", err)
+	}
+	for _, ev := range j.Events {
+		if ev.Kind == "track" || ev.Kind == "received" {
+			t.Fatalf("处理经过不应出现失败的继续跟踪/接收：%+v", ev)
+		}
+	}
+	if j.Item.CurrentShiftID != a.ID {
+		t.Fatalf("处理经过视图中事项仍应在交班班次")
+	}
+
+	// 交班班次结束时记录保留原内容与负责人，不受失败处理影响。
+	raAfter, err := f.svc.ShiftReport(a.ID)
+	if err != nil {
+		t.Fatalf("report a after fail: %v", err)
+	}
+	snapAfter := findCloseItem(raAfter, itLast.ID)
+	if snapAfter == nil {
+		t.Fatalf("失败后交班班次结束时记录仍应包含最后一项")
+	}
+	if snapAfter.Content != snapBefore.Content || snapAfter.Severity != snapBefore.Severity ||
+		snapAfter.Constraints != snapBefore.Constraints || snapAfter.FollowOwner != snapBefore.FollowOwner ||
+		snapAfter.Closed != snapBefore.Closed {
+		t.Fatalf("交班班次结束时记录应保留原内容与负责人：\nbefore %+v\nafter  %+v", snapBefore, snapAfter)
+	}
+	if snapAfter.FollowOwner != "李四" {
+		t.Fatalf("结束时记录负责人应仍为李四，got %s", snapAfter.FollowOwner)
+	}
+	// 接班班次此时不应出现最后一项。
+	rb, err := f.svc.ShiftReport(b.ID)
+	if err != nil {
+		t.Fatalf("report b after fail: %v", err)
+	}
+	for _, x := range rb.Items {
+		if x.ID == itLast.ID {
+			t.Fatalf("失败后最后一项不应进入接班班次清单")
+		}
+	}
+	// 接班班次因交接仍未完成而不能结束。
+	if _, err := f.svc.CloseShift(b.ID); !errors.Is(err, ErrHandoverState) {
+		t.Fatalf("交接未完成时接班班次不能结束，got %v", err)
+	}
+
+	// 磁盘文件与失败前逐字节一致。
+	assertDataFileUntouched(t, f.store.Path(), savedBefore)
+
+	// ---- 重新打开：看到的进度、事项班次、负责人与失败前一致 ----
+	f.reopen(t)
+	h2, err := f.svc.GetHandover(h.ID)
+	if err != nil {
+		t.Fatalf("get handover after reopen: %v", err)
+	}
+	if h2.Completed() || h2.CompletedAt != nil {
+		t.Fatalf("重开后整份交接仍应未完成、无完成时间：%+v", h2)
+	}
+	e2 := findEntryOf(t, h2, itLast.ID)
+	if e2.Status != EntryPending || e2.Operator != "" || e2.ProcessedAt != nil ||
+		e2.TrackingNote != "" || e2.FollowOwner != "李四" {
+		t.Fatalf("重开后最后一项应与失败前一致（待处理/尚未处理/原负责人）：%+v", e2)
+	}
+	it2, err := f.svc.GetItem(itLast.ID)
+	if err != nil {
+		t.Fatalf("get item after reopen: %v", err)
+	}
+	if it2.CurrentShiftID != a.ID || it2.FollowOwner != "李四" || len(it2.ShiftIDs) != 1 {
+		t.Fatalf("重开后事项班次与负责人应与失败前一致：%+v", it2)
+	}
+	eDone2 := findEntryOf(t, h2, itDone.ID)
+	if eDone2.Status != EntryConfirmed || eDone2.Operator != "李四" {
+		t.Fatalf("重开后已接收事项结果应保留：%+v", eDone2)
+	}
+	raRe, err := f.svc.ShiftReport(a.ID)
+	if err != nil {
+		t.Fatalf("report a after reopen: %v", err)
+	}
+	if s := findCloseItem(raRe, itLast.ID); s == nil || s.FollowOwner != "李四" {
+		t.Fatalf("重开后交班班次结束时记录应保持原样：%+v", s)
+	}
+
+	// ---- 保存条件恢复后再次提交继续跟踪：按现有功能成功接收 ----
+	successAt := tsDay(2, 19, 0)
+	f.svc.nowAt(func() time.Time { return successAt })
+	res, err := f.svc.ProcessEntry(h.ID, itLast.ID, ActionTrack, "李四", "", "每两小时记录一次压力", "王五")
+	if err != nil {
+		t.Fatalf("保存恢复后继续跟踪应成功：%v", err)
+	}
+	if !res.Completed() || res.CompletedAt == nil || !res.CompletedAt.Equal(successAt) {
+		t.Fatalf("整份交接完成时间应以本次成功处理 19:00 为准：%+v", res)
+	}
+
+	final, err := f.svc.GetHandover(h.ID)
+	if err != nil {
+		t.Fatalf("get final handover: %v", err)
+	}
+	if !final.Completed() {
+		t.Fatalf("最终交接应完成")
+	}
+	ef := findEntryOf(t, final, itLast.ID)
+	if ef.Status != EntryTracking || ef.Operator != "李四" ||
+		ef.ProcessedAt == nil || !ef.ProcessedAt.Equal(successAt) {
+		t.Fatalf("最后一项应记录本次成功继续跟踪的处理人与时间：%+v", ef)
+	}
+	if ef.TrackingNote != "每两小时记录一次压力" || ef.FollowOwner != "王五" {
+		t.Fatalf("应使用本次填写的跟踪说明与负责人：%+v", ef)
+	}
+	if len(ef.Rounds) != 0 {
+		t.Fatalf("成功接收不应附带失败尝试的任何轮次：%+v", ef.Rounds)
+	}
+
+	// 事项保留原编号、进入接班班次、负责人更新为本次值。
+	itf, err := f.svc.GetItem(itLast.ID)
+	if err != nil {
+		t.Fatalf("get final item: %v", err)
+	}
+	if itf.ID != itLast.ID || itf.OriginShiftID != a.ID {
+		t.Fatalf("应保留事项编号与原始班次：%+v", itf)
+	}
+	if itf.CurrentShiftID != b.ID {
+		t.Fatalf("成功接收后事项应进入接班班次 %s，got %s", b.ID, itf.CurrentShiftID)
+	}
+	if itf.FollowOwner != "王五" {
+		t.Fatalf("成功接收后事项后续负责人应为本次填写的王五，got %s", itf.FollowOwner)
+	}
+
+	// 处理经过只留下成功的这一次接收，失败尝试不成为历史事实。
+	var received []ItemEvent
+	for _, ev := range itf.Events {
+		if ev.Kind == "received" {
+			received = append(received, ev)
+		}
+	}
+	if len(received) != 1 {
+		t.Fatalf("处理经过应只留下一次接收，got %d：%+v", len(received), received)
+	}
+	if !received[0].At.Equal(successAt) || received[0].Operator != "李四" {
+		t.Fatalf("唯一接收记录应为本次成功操作：%+v", received[0])
+	}
+	jf, err := f.svc.ItemJourney(itLast.ID)
+	if err != nil {
+		t.Fatalf("final journey: %v", err)
+	}
+	var tracks []JourneyEvent
+	for _, ev := range jf.Events {
+		if ev.Kind == "track" {
+			tracks = append(tracks, ev)
+		}
+	}
+	if len(tracks) != 1 || !tracks[0].At.Equal(successAt) ||
+		tracks[0].TrackingNote != "每两小时记录一次压力" || tracks[0].FollowOwner != "王五" {
+		t.Fatalf("处理经过应只保留成功的这一次继续跟踪：%+v", tracks)
+	}
+	if len(jf.Results) != 1 || jf.Results[0].Entry.Status != EntryTracking {
+		t.Fatalf("交接当前结果应只有一次成功的继续跟踪：%+v", jf.Results)
+	}
+
+	// 成功后接班班次可正常结束。
+	if _, err := f.svc.CloseShift(b.ID); err != nil {
+		t.Fatalf("交接完成后接班班次应能结束：%v", err)
+	}
+
+	// 重开后成功结果保留，且仍只有一次接收（失败尝试彻底不存在）。
+	f.reopen(t)
+	hc, err := f.svc.GetHandover(h.ID)
+	if err != nil {
+		t.Fatalf("get handover final reopen: %v", err)
+	}
+	if !hc.Completed() || hc.CompletedAt == nil || !hc.CompletedAt.Equal(successAt) {
+		t.Fatalf("重开后完成时间应为本次成功处理 19:00：%+v", hc)
+	}
+	itc, _ := f.svc.GetItem(itLast.ID)
+	n := 0
+	for _, ev := range itc.Events {
+		if ev.Kind == "received" {
+			n++
+		}
+	}
+	if n != 1 || itc.CurrentShiftID != b.ID || itc.FollowOwner != "王五" {
+		t.Fatalf("重开后应仍只有一次成功接收且班次/负责人正确：n=%d %+v", n, itc)
+	}
+}
