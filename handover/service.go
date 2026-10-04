@@ -2,6 +2,7 @@ package handover
 
 import (
 	"fmt"
+	"regexp"
 	"sort"
 	"strings"
 	"time"
@@ -729,8 +730,11 @@ func (svc *Service) GetItem(id string) (Item, error) {
 // 重新提交、确认接收或继续跟踪），无须先知道涉及哪些交接编号。
 // 经过按实际发生时刻排序（带不同时区的时间按同一实际时刻比较）；同一时刻下
 // 同一交接内保持发起、该轮退回、该轮重新提交、后续处理的先后，不同交接按
-// 交接编号排列。同一次接收若已出现在事项历史里只展示一次。只读查询，
-// 不改变事项、交接进度或班次结束时记录。
+// 交接编号排列。同一次接收若已出现在事项历史里只展示一次；是否同一次接收不能
+// 只凭同一操作人与同一时刻，还要看接收说明中明确记载的接班班次与接收方式是否
+// 与交接记录相容且能唯一对应，明确记载不同（接班班次不同，或确认接收与继续
+// 跟踪之别）、记载不足或无法唯一对应的历史都原样保留，不补造交接编号。只读
+// 查询，不改变事项、交接进度或班次结束时记录。
 func (svc *Service) ItemJourney(itemID string) (ItemJourney, error) {
 	itemID = clean(itemID)
 	d := &svc.store.data
@@ -755,9 +759,27 @@ func (svc *Service) ItemJourney(itemID string) (ItemJourney, error) {
 		seq++
 	}
 
-	// received 事件与交接中的接收处理是同一次接收，只展示一次（以交接事件
-	// 展示，信息更全）；匹配不上的旧数据 received 事件仍原样保留。
-	receivedUsed := make([]bool, len(it.Events))
+	// received 事件与交接中的接收处理可能记录的是同一次接收，此时只展示一次
+	// （以交接事件展示，信息更全：交接编号、交班与接班班次、处理结果、操作人、
+	// 时间，继续跟踪还带跟踪说明与当时的后续负责人）。但不能仅凭同一个人和同一
+	// 时刻判定重复：同一人同一时刻可能分别记录了交给不同班次、或以不同方式
+	// （确认接收/继续跟踪）的接收。先收集全部交接接收与事项历史中的接收说明，
+	// 再做双向唯一匹配：只有一方只与另一方相容、另一方也只与它相容时才合并；
+	// 记载缺失、互相矛盾、或任何一边无法唯一对应的，一律各自原样保留，不凭班次
+	// 负责人、事项当前位置或当前处理结果猜测归属，结果与记录的存放先后无关。
+	// 匹配不上的旧 received 事件（包括没有对应交接清单的旧说明）同样原样保留，
+	// 不补造交接编号。
+	receivedInfo := make([]receivedRecord, len(it.Events))
+	for i := range it.Events {
+		receivedInfo[i] = parseReceivedRecord(it.Events[i])
+	}
+	type receiptRef struct {
+		toShift  string
+		kind     string // confirm / track
+		operator string
+		at       time.Time
+	}
+	var receipts []receiptRef
 
 	hs := append([]Handover(nil), d.Handovers...)
 	sort.Slice(hs, func(i, k int) bool { return hs[i].ID < hs[k].ID })
@@ -816,16 +838,59 @@ func (svc *Service) ItemJourney(itemID string) (ItemJourney, error) {
 				ev.At, ev.TimeKnown = *e.ProcessedAt, true
 			}
 			add(ev, h.ID)
+			// 交接接收先收集起来，循环结束后与事项历史里的接收说明统一做
+			// 双向唯一匹配，避免按交接或历史的存放先后挑中某一条。
 			if validProcessedAt(e.ProcessedAt) {
-				for i := range it.Events {
-					iev := &it.Events[i]
-					if iev.Kind == "received" && !receivedUsed[i] &&
-						iev.At.Equal(*e.ProcessedAt) && iev.Operator == e.Operator {
-						receivedUsed[i] = true
-						break
-					}
-				}
+				receipts = append(receipts, receiptRef{
+					toShift:  h.ToShiftID,
+					kind:     kind,
+					operator: e.Operator,
+					at:       *e.ProcessedAt,
+				})
 			}
+		}
+	}
+
+	// 双向唯一匹配：只在明确记载的接班班次或接收方式中至少有一项可核对、且与
+	// 交接接收相容（其余字段未记载的不否定匹配）、操作人与实际时刻一致、两边都
+	// 只对应同一对象时，才把该 received 事件并入交接接收。没有任何可核对字段、
+	// 或任何一边有多个相容对象的，都无法确认同一次接收，全部原样保留。
+	receivedUsed := make([]bool, len(it.Events))
+	for ri := range receipts {
+		r := receipts[ri]
+		var candidates []int
+		for i := range it.Events {
+			iev := &it.Events[i]
+			if iev.Kind != "received" {
+				continue
+			}
+			if iev.Operator != r.operator || !iev.At.Equal(r.at) {
+				continue
+			}
+			if !receivedInfo[i].identified() {
+				continue
+			}
+			if receivedInfo[i].compatibleWith(r.toShift, r.kind) {
+				candidates = append(candidates, i)
+			}
+		}
+		if len(candidates) != 1 {
+			continue
+		}
+		// 反向检查：该 received 事件也只能唯一对应到这次交接接收。
+		ei := candidates[0]
+		var receiptMatches int
+		for q := range receipts {
+			o := receipts[q]
+			if o.operator != it.Events[ei].Operator || !o.at.Equal(it.Events[ei].At) {
+				continue
+			}
+			if receivedInfo[ei].compatibleWith(o.toShift, o.kind) {
+				receiptMatches++
+			}
+		}
+		if receiptMatches == 1 {
+			receivedUsed[ei] = true
 		}
 	}
 
@@ -858,6 +923,58 @@ func (svc *Service) ItemJourney(itemID string) (ItemJourney, error) {
 		j.Events = append(j.Events, ke.ev)
 	}
 	return j, nil
+}
+
+// receivedRecord 是从事项自身历史中 received 事件说明里解析出的、当时明确
+// 记载的接收信息。空字段表示该说明没有明确记载这一项，不能从事项当前状态、
+// 班次负责人或当前处理结果猜测补齐。
+type receivedRecord struct {
+	toShift string // 明确记载的接班班次编号
+	kind    string // confirm / track
+}
+
+// receivedShiftRe 匹配接收说明中明确写下的接班班次，例如
+// “接班班次 S002 接收：确认接收”。
+var receivedShiftRe = regexp.MustCompile(`接班班次\s*(S[0-9]+)`)
+
+// parseReceivedRecord 只提取 received 事件说明中明确写下的接班班次与接收方式
+// （确认接收/继续跟踪）。旧数据中不是这一格式的说明，相应字段留空；空只表示
+// “未记载”，匹配时既不靠它排除、也不靠外部信息补猜。
+func parseReceivedRecord(ev ItemEvent) receivedRecord {
+	if ev.Kind != "received" {
+		return receivedRecord{}
+	}
+	var rec receivedRecord
+	if m := receivedShiftRe.FindStringSubmatch(ev.Detail); m != nil {
+		rec.toShift = m[1]
+	}
+	switch {
+	case strings.Contains(ev.Detail, EntryTracking.Label()):
+		rec.kind = "track"
+	case strings.Contains(ev.Detail, EntryConfirmed.Label()):
+		rec.kind = "confirm"
+	}
+	return rec
+}
+
+// compatibleWith 报告接收说明中明确记载的接班班次与接收方式是否与某次交接接收
+// 相容：说明未记载的字段不否定匹配；任一字段有明确记载且与交接记录不同
+// （接班班次不同，或一个是确认接收、另一个是继续跟踪），就不是同一次接收。
+func (r receivedRecord) compatibleWith(toShift, kind string) bool {
+	if r.toShift != "" && r.toShift != toShift {
+		return false
+	}
+	if r.kind != "" && r.kind != kind {
+		return false
+	}
+	return true
+}
+
+// identified 报告接收说明是否至少明确记载了接班班次或接收方式之一。只凭同一
+// 操作人与同一时刻不足以确认同一次接收：说明里没有任何可核对字段的旧记录
+// （无法确认归属）一律原样保留，不靠班次负责人、事项当前位置或当前处理结果猜测。
+func (r receivedRecord) identified() bool {
+	return r.toShift != "" || r.kind != ""
 }
 
 // GetHandover 按编号查询交接。

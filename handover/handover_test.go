@@ -2172,6 +2172,175 @@ func TestItemJourneyProcessedMissingTime(t *testing.T) {
 	}
 }
 
+// buildReceivedMergeRaw 构造一份旧数据：H001 把 I001 由甲班（S001）交给乙班
+// （S002），接手人选择继续跟踪，处理人“记录人”、处理时刻 12:00+08:00；
+// 事项历史里按 extraEvents 给出的顺序放接收说明。另有一个丙班 S003，但没有
+// 对应交接清单。
+func buildReceivedMergeRaw(extraEvents string) string {
+	return `{
+  "shift_seq": 3, "item_seq": 1, "handover_seq": 1, "note_seq": 0,
+  "shifts": [
+    {"id":"S001","position":"调度","owner":"甲","start":"2026-10-02T08:00:00+08:00","end":"2026-10-02T16:00:00+08:00","created_at":"2026-10-02T08:00:00+08:00","closed":true},
+    {"id":"S002","position":"调度","owner":"乙","start":"2026-10-02T16:00:00+08:00","end":"2026-10-02T23:00:00+08:00","created_at":"2026-10-02T08:00:00+08:00","closed":false},
+    {"id":"S003","position":"调度","owner":"丙","start":"2026-10-03T00:00:00+08:00","end":"2026-10-03T08:00:00+08:00","created_at":"2026-10-02T08:00:00+08:00","closed":false}
+  ],
+  "items": [
+    {"id":"I001","origin_shift_id":"S001","shift_ids":["S001","S002"],"current_shift_id":"S002",
+     "content":"压力异常","severity":"important","follow_owner":"跟踪负责人",
+     "created_at":"2026-10-02T09:00:00+08:00",
+     "events":[
+       {"at":"2026-10-02T09:00:00+08:00","kind":"created","detail":"事项建立"}` + extraEvents + `
+     ]}
+  ],
+  "handovers": [
+    {"id":"H001","position":"调度","from_shift_id":"S001","to_shift_id":"S002",
+     "created_at":"2026-10-02T11:00:00+08:00","completed_at":"2026-10-02T12:00:00+08:00",
+     "entries":[
+       {"item_id":"I001","content":"压力异常","severity":"important","follow_owner":"跟踪负责人",
+        "status":"tracking","operator":"记录人","processed_at":"2026-10-02T12:00:00+08:00",
+        "tracking_note":"跟踪说明XYZ","follow_owner":"跟踪负责人"}
+     ]}
+  ],
+  "notes": []
+}`
+}
+
+// TestItemJourneyMergeDistinguishesShiftAndMethod：同一操作人、同一时刻分别记录了
+// 交给乙班的继续跟踪与一条旧的交给丙班的确认接收说明时，查询必须完整保留交给
+// 丙班的原说明（即使它没有对应交接清单，也不补造交接编号），而交给乙班的继续
+// 跟踪只展示一次；结果与两条历史的存放先后无关。
+func TestItemJourneyMergeDistinguishesShiftAndMethod(t *testing.T) {
+	noteToB := `,
+       {"at":"2026-10-02T12:00:00+08:00","kind":"received","operator":"记录人",
+        "detail":"接班班次 S002 接收：继续跟踪；跟踪说明：跟踪说明XYZ；后续负责人：跟踪负责人"}`
+	noteToC := `,
+       {"at":"2026-10-02T12:00:00+08:00","kind":"received","operator":"记录人",
+        "detail":"接班班次 S003 接收：确认接收"}`
+
+	for _, tc := range []struct {
+		name   string
+		events string
+	}{
+		{"乙班说明在前", noteToB + noteToC},
+		{"丙班说明在前", noteToC + noteToB},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			svc := openLegacyService(t, buildReceivedMergeRaw(tc.events))
+			j, err := svc.ItemJourney("I001")
+			if err != nil {
+				t.Fatalf("journey: %v", err)
+			}
+			var received, track []JourneyEvent
+			for _, ev := range j.Events {
+				switch ev.Kind {
+				case "received":
+					received = append(received, ev)
+				case "track":
+					track = append(track, ev)
+				}
+			}
+			if len(track) != 1 {
+				t.Fatalf("交给乙班的继续跟踪应只展示一次：%+v", j.Events)
+			}
+			if len(received) != 1 {
+				t.Fatalf("交给丙班的旧接收说明应完整保留一条：%+v", j.Events)
+			}
+			// 继续跟踪事件带出交接编号、两班关系、本次保存的处理结果、操作人、
+			// 时间，以及当时的跟踪说明与后续负责人。
+			tr := track[0]
+			if tr.HandoverID != "H001" || tr.FromShift != "S001" || tr.ToShift != "S002" ||
+				tr.Operator != "记录人" || !tr.TimeKnown ||
+				tr.TrackingNote != "跟踪说明XYZ" || tr.FollowOwner != "跟踪负责人" {
+				t.Fatalf("继续跟踪记录不完整：%+v", tr)
+			}
+			// 保留下来的旧说明是交给丙班的确认接收，且不凭空补交接编号。
+			old := received[0]
+			if old.HandoverID != "" || !strings.Contains(old.Detail, "S003") ||
+				!strings.Contains(old.Detail, "确认接收") {
+				t.Fatalf("应原样保留交给丙班的确认接收说明且不补交接编号：%+v", old)
+			}
+			text := FormatItemJourney(j)
+			if !strings.Contains(text, "交接 H001（S001 -> S002）继续跟踪") ||
+				!strings.Contains(text, "接班班次 S003 接收：确认接收") {
+				t.Fatalf("展示应同时包含乙班跟踪与丙班原说明：\n%s", text)
+			}
+		})
+	}
+}
+
+// TestItemJourneyMergeDifferentMethodNotMerged：同一时刻、同一操作人、接班班次
+// 相同，但接收方式明确记载不同（旧说明为确认接收，本次交接为继续跟踪）时，
+// 不能当成同一次接收隐藏。
+func TestItemJourneyMergeDifferentMethodNotMerged(t *testing.T) {
+	events := `,
+       {"at":"2026-10-02T12:00:00+08:00","kind":"received","operator":"记录人",
+        "detail":"接班班次 S002 接收：确认接收"}`
+	svc := openLegacyService(t, buildReceivedMergeRaw(events))
+	j, err := svc.ItemJourney("I001")
+	if err != nil {
+		t.Fatalf("journey: %v", err)
+	}
+	var received, track int
+	for _, ev := range j.Events {
+		switch ev.Kind {
+		case "received":
+			received++
+		case "track":
+			track++
+		}
+	}
+	if received != 1 || track != 1 {
+		t.Fatalf("接收方式明确不同的两条记录应各自保留：%v", journeyKinds(j))
+	}
+}
+
+// TestItemJourneyMergeUnidentifiedNoteKept：旧接收说明没有明确记载接班班次或
+// 接收方式时，不能仅凭同一操作人与同一时刻并入交接接收，应原样保留。
+func TestItemJourneyMergeUnidentifiedNoteKept(t *testing.T) {
+	events := `,
+       {"at":"2026-10-02T12:00:00+08:00","kind":"received","operator":"记录人",
+        "detail":"旧记录：当时口头接手，无交接清单"}`
+	svc := openLegacyService(t, buildReceivedMergeRaw(events))
+	j, err := svc.ItemJourney("I001")
+	if err != nil {
+		t.Fatalf("journey: %v", err)
+	}
+	var received, track int
+	for _, ev := range j.Events {
+		switch ev.Kind {
+		case "received":
+			received++
+		case "track":
+			track++
+		}
+	}
+	if received != 1 || track != 1 {
+		t.Fatalf("信息不足、无法确认同一次接收的旧说明应原样展示：%v", journeyKinds(j))
+	}
+}
+
+// TestItemJourneyMergeAcrossTimeZones：交接处理时间与事项接收说明用不同时区
+// 表示同一实际时刻时，仍能正确识别为同一次接收，只展示一次。
+func TestItemJourneyMergeAcrossTimeZones(t *testing.T) {
+	// 13:00+09:00 与 12:00+08:00 是同一实际时刻。
+	events := `,
+       {"at":"2026-10-02T13:00:00+09:00","kind":"received","operator":"记录人",
+        "detail":"接班班次 S002 接收：继续跟踪；跟踪说明：跟踪说明XYZ；后续负责人：跟踪负责人"}`
+	svc := openLegacyService(t, buildReceivedMergeRaw(events))
+	j, err := svc.ItemJourney("I001")
+	if err != nil {
+		t.Fatalf("journey: %v", err)
+	}
+	for _, ev := range j.Events {
+		if ev.Kind == "received" {
+			t.Fatalf("不同时区表示的同一时刻应识别为同一次接收：%+v", ev)
+		}
+	}
+	if got := joinStrings(journeyKinds(j)); got != "created,handover-init,track" {
+		t.Fatalf("同一次接收只应展示交接中的继续跟踪：%v", got)
+	}
+}
+
 // legacyProcessedMissingTimeRaw 构造一份旧数据：同一交接中包含已确认缺处理时间、
 // 继续跟踪（处理人缺失且时间零值）、退回（时间零值但退回轮次时间真实）以及真正
 // 待处理四类事项。
