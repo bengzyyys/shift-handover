@@ -2611,3 +2611,419 @@ func TestUncertainResultInOneHandoverBlocksShiftClose(t *testing.T) {
 		t.Fatalf("全部交接完成后应能结束：%v", err)
 	}
 }
+
+// openUncertainHandoverWithCompletedAt 打开三项不确定结果旧数据
+// （一项已确认缺处理人/时间、一项结果缺失、一项无法识别），并把交接的旧
+// 完成时间替换为指定 JSON 片段：传旧时间、零值时间或删除该字段（nil）。
+func openUncertainHandoverWithCompletedAt(t *testing.T, completedAtJSON string) *Service {
+	t.Helper()
+	raw := strings.Replace(legacyUncertainResultRaw,
+		`"completed_at":"2026-10-02T15:00:00+08:00",`, completedAtJSON, 1)
+	return openLegacyService(t, raw)
+}
+
+// TestSupplementUncertainResultsRewritesStaleCompletedAt：旧交接保存了 15:00
+// 的完成时间，但清单中一项结果缺失、一项无法识别时，交接显示未完成；接班人
+// 18:00 先接收其中一项后仍未完成，另一项保留原异常提示；19:00 把最后一项
+// 接收（继续跟踪）后整份交接才完成，完成时间保存为 19:00 这次成功处理时间，
+// 而不是旧的 15:00。交接查询与交班、接班两侧班次报告展示一致；已有明确接收
+// 结果的旧项（缺处理人/处理时间）不被改写；重开后时间保留。
+func TestSupplementUncertainResultsRewritesStaleCompletedAt(t *testing.T) {
+	svc := openUncertainHandoverWithCompletedAt(t, `"completed_at":"2026-10-02T15:00:00+08:00",`)
+	stale := tsDay(2, 15, 0)
+	at18 := tsDay(2, 18, 0)
+	at19 := tsDay(2, 19, 0)
+	svc.nowAt(func() time.Time { return at18 })
+
+	h, err := svc.GetHandover("H001")
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if h.Completed() || h.CompletedAt == nil || !h.CompletedAt.Equal(stale) {
+		t.Fatalf("前置：交接未完成但留有旧完成时间 15:00：%+v", h)
+	}
+
+	// 18:00 接收结果缺失的 I002：仍有无法识别项，交接保持未完成，旧时间不动。
+	if _, err := svc.ProcessEntry("H001", "I002", ActionConfirm, "李四", "", "", ""); err != nil {
+		t.Fatalf("confirm I002: %v", err)
+	}
+	h, _ = svc.GetHandover("H001")
+	if h.Completed() {
+		t.Fatalf("仍有无法识别项时不应完成")
+	}
+	if h.CompletedAt == nil || !h.CompletedAt.Equal(stale) {
+		t.Fatalf("未完成时不应改写旧完成时间，want %v got %v", stale, h.CompletedAt)
+	}
+	htext := FormatHandover(h)
+	if !strings.Contains(htext, "未完成") || strings.Contains(htext, "[已完成") {
+		t.Fatalf("交接应显示未完成：\n%s", htext)
+	}
+	if !strings.Contains(htext, "处理结果无法识别（原值：archived）") {
+		t.Fatalf("另一项应保留原异常结果提示：\n%s", htext)
+	}
+
+	// 两侧班次报告此时都应显示未完成。
+	for _, shiftID := range []string{"S001", "S002"} {
+		rep, err := svc.ShiftReport(shiftID)
+		if err != nil {
+			t.Fatalf("report %s: %v", shiftID, err)
+		}
+		rtext := FormatReport(rep)
+		if !strings.Contains(rtext, "[未完成]") || strings.Contains(rtext, "[已完成") {
+			t.Fatalf("shift-show %s 应与交接查询一致显示未完成：\n%s", shiftID, rtext)
+		}
+	}
+
+	// 19:00 把最后一项填写跟踪说明与后续负责人后继续跟踪：整份交接完成，
+	// 完成时间覆盖为 19:00。
+	svc.nowAt(func() time.Time { return at19 })
+	if _, err := svc.ProcessEntry("H001", "I003", ActionTrack, "李四", "", "持续跟进压力", "王五"); err != nil {
+		t.Fatalf("track I003: %v", err)
+	}
+	h, _ = svc.GetHandover("H001")
+	if !h.Completed() {
+		t.Fatalf("三项全部明确接收后应完成")
+	}
+	if h.CompletedAt == nil || !h.CompletedAt.Equal(at19) {
+		t.Fatalf("完成时间应为最后一次成功处理时间 19:00，got %v", h.CompletedAt)
+	}
+	htext = FormatHandover(h)
+	if !strings.Contains(htext, "已完成 2026-10-02 19:00:00 +08:00") {
+		t.Fatalf("交接查询应展示新的完成时间 19:00：\n%s", htext)
+	}
+	if strings.Contains(htext, "未完成") || strings.Contains(htext, "15:00:00") {
+		t.Fatalf("不应再显示未完成或旧的 15:00：\n%s", htext)
+	}
+
+	// 各项结果与处理经过：旧已确认项不被改写，新处理两项保留本次结果与人、时间。
+	es := map[string]HandoverEntry{}
+	for _, e := range h.Entries {
+		es[e.ItemID] = e
+	}
+	e1 := es["I001"]
+	if e1.Status != EntryConfirmed || e1.Operator != "" || e1.ProcessedAt != nil {
+		t.Fatalf("已有明确接收结果的旧项不应被改写（仍缺处理人/时间）：%+v", e1)
+	}
+	e2 := es["I002"]
+	if e2.Status != EntryConfirmed || e2.Operator != "李四" || e2.ProcessedAt == nil ||
+		!e2.ProcessedAt.Equal(at18) {
+		t.Fatalf("I002 应保留 18:00 的确认接收经过：%+v", e2)
+	}
+	e3 := es["I003"]
+	if e3.Status != EntryTracking || e3.Operator != "李四" || e3.ProcessedAt == nil ||
+		!e3.ProcessedAt.Equal(at19) || e3.TrackingNote != "持续跟进压力" || e3.FollowOwner != "王五" ||
+		len(e3.Rounds) != 0 {
+		t.Fatalf("I003 应保留 19:00 的继续跟踪结果与经过，退回历史不应被编造：%+v", e3)
+	}
+
+	// 交接查询、交班/接班班次报告嵌入的交接清单与末尾结果说明一致。
+	for _, shiftID := range []string{"S001", "S002"} {
+		rep, err := svc.ShiftReport(shiftID)
+		if err != nil {
+			t.Fatalf("report %s: %v", shiftID, err)
+		}
+		rtext := FormatReport(rep)
+		for _, want := range []string{
+			"已完成 2026-10-02 19:00:00 +08:00",
+			"[确认接收]", "[继续跟踪]",
+			"事项 I002 交接 H001（S001 -> S002）当前结果：确认接收；处理人=李四",
+			"事项 I003 交接 H001（S001 -> S002）当前结果：继续跟踪；处理人=李四",
+		} {
+			if !strings.Contains(rtext, want) {
+				t.Fatalf("shift-show %s 缺少 %q：\n%s", shiftID, want, rtext)
+			}
+		}
+		if strings.Contains(rtext, "[未完成]") ||
+			strings.Contains(rtext, "处理结果无法识别（原值：") ||
+			strings.Contains(rtext, "[处理结果未记录]") {
+			t.Fatalf("shift-show %s 不应再出现未完成或异常结果标签：\n%s", shiftID, rtext)
+		}
+	}
+
+	// 事项处理经过：I001 的接收时间仍未记录，I003 记录 19:00 的继续跟踪。
+	j1, err := svc.ItemJourney("I001")
+	if err != nil {
+		t.Fatalf("journey I001: %v", err)
+	}
+	if got := journeyKinds(j1); joinStrings(got) != "created,handover-init,confirm" {
+		t.Fatalf("I001 经过不应被改写：%v", got)
+	}
+	if j1.Events[2].TimeKnown || j1.Events[2].Operator != "" {
+		t.Fatalf("I001 旧接收缺人/缺时间不能因修正完成时间而被补造：%+v", j1.Events[2])
+	}
+	j3, err := svc.ItemJourney("I003")
+	if err != nil {
+		t.Fatalf("journey I003: %v", err)
+	}
+	var trackAt time.Time
+	for _, ev := range j3.Events {
+		if ev.Kind == "track" {
+			trackAt = ev.At
+		}
+	}
+	if trackAt.IsZero() || !trackAt.Equal(at19) {
+		t.Fatalf("I003 经过应保留 19:00 的继续跟踪，got %v", trackAt)
+	}
+
+	// 重开后新完成时间与结果仍在。
+	store, err := Open(svc.store.Path())
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	svc = NewService(store)
+	h, _ = svc.GetHandover("H001")
+	if !h.Completed() || h.CompletedAt == nil || !h.CompletedAt.Equal(at19) {
+		t.Fatalf("重开后应保留 19:00 的完成时间：%+v", h)
+	}
+}
+
+// TestCompletedAtMissingOrZeroFilledAtActualTime：旧记录没有完成时间或只留
+// 零值时间时，逐项补齐、最后一项成功接收后按这次实际处理时间记录，不沿用零值。
+func TestCompletedAtMissingOrZeroFilledAtActualTime(t *testing.T) {
+	cases := map[string]string{
+		"nil":  "",
+		"zero": `"completed_at":"0001-01-01T00:00:00Z",`,
+	}
+	for name, frag := range cases {
+		t.Run(name, func(t *testing.T) {
+			svc := openUncertainHandoverWithCompletedAt(t, frag)
+			at18 := tsDay(2, 18, 0)
+			at19 := tsDay(2, 19, 0)
+			svc.nowAt(func() time.Time { return at18 })
+
+			h, _ := svc.GetHandover("H001")
+			if h.Completed() {
+				t.Fatalf("前置应未完成")
+			}
+			if name == "zero" && (h.CompletedAt == nil || !h.CompletedAt.IsZero()) {
+				t.Fatalf("前置应留有零值完成时间：%+v", h.CompletedAt)
+			}
+
+			if _, err := svc.ProcessEntry("H001", "I002", ActionConfirm, "李四", "", "", ""); err != nil {
+				t.Fatalf("confirm I002: %v", err)
+			}
+			h, _ = svc.GetHandover("H001")
+			if h.Completed() {
+				t.Fatalf("仍有无法识别项时不应完成")
+			}
+			if name == "nil" && h.CompletedAt != nil {
+				t.Fatalf("未全部接收时不能提前补造完成时间：%+v", h.CompletedAt)
+			}
+
+			svc.nowAt(func() time.Time { return at19 })
+			if _, err := svc.ProcessEntry("H001", "I003", ActionConfirm, "李四", "", "", ""); err != nil {
+				t.Fatalf("confirm I003: %v", err)
+			}
+			h, _ = svc.GetHandover("H001")
+			if !h.Completed() || h.CompletedAt == nil || h.CompletedAt.IsZero() || !h.CompletedAt.Equal(at19) {
+				t.Fatalf("应按 19:00 这次实际完成操作记录时间：%+v", h.CompletedAt)
+			}
+		})
+	}
+}
+
+// TestFailedOrNonReceivingProcessKeepsStaleCompletedAt：对结果缺失项的最后一次
+// 处理因缺少必填信息失败时，该项保持原结果，交接不能提前完成、旧完成时间不被
+// 覆盖；退回与补充后重新提交本身也不更新时间；直到最后一项真正成功接收才记录
+// 那次时间。
+func TestFailedOrNonReceivingProcessKeepsStaleCompletedAt(t *testing.T) {
+	svc := openUncertainHandoverWithCompletedAt(t, `"completed_at":"2026-10-02T15:00:00+08:00",`)
+	stale := tsDay(2, 15, 0)
+	svc.nowAt(func() time.Time { return tsDay(2, 18, 0) })
+
+	// 未补齐前接班班次不能结束。
+	if _, err := svc.CloseShift("S002"); !errors.Is(err, ErrHandoverState) {
+		t.Fatalf("交接未完成时接班班次不能结束，got %v", err)
+	}
+
+	// 对结果缺失项 I002 的处理因必填信息缺失而失败：状态、完成情况与旧时间不变。
+	if _, err := svc.ProcessEntry("H001", "I002", ActionTrack, "李四", "", "   ", " "); !errors.Is(err, ErrInvalidInput) {
+		t.Fatalf("继续跟踪缺跟踪说明与负责人应失败，got %v", err)
+	}
+	if _, err := svc.ProcessEntry("H001", "I002", ActionReturn, "李四", "  ", "", ""); !errors.Is(err, ErrInvalidInput) {
+		t.Fatalf("退回缺原因应失败，got %v", err)
+	}
+	if _, err := svc.ProcessEntry("H001", "I002", ActionConfirm, "   ", "", "", ""); !errors.Is(err, ErrInvalidInput) {
+		t.Fatalf("缺操作人应失败，got %v", err)
+	}
+	h, _ := svc.GetHandover("H001")
+	e2 := findEntryOf(t, h, "I002")
+	if e2.Status != "" || e2.Operator != "" || e2.ProcessedAt != nil {
+		t.Fatalf("失败处理应保持结果缺失原状：%+v", e2)
+	}
+	if h.Completed() || h.CompletedAt == nil || !h.CompletedAt.Equal(stale) {
+		t.Fatalf("失败后交接应仍未完成且旧时间不变：%+v", h)
+	}
+
+	// 退回 I002（18:00）：交接仍未完成，旧时间不动。
+	if _, err := svc.ProcessEntry("H001", "I002", ActionReturn, "李四", "需要补充", "", ""); err != nil {
+		t.Fatalf("return I002: %v", err)
+	}
+	// 交班人补充并重新提交（18:30）：恢复待处理，但重新提交本身不表示接收，
+	// 完成时间仍是旧的 15:00。
+	svc.nowAt(func() time.Time { return tsDay(2, 18, 30) })
+	if _, err := svc.ResubmitReturned("H001", "I002", "张三", "补充材料"); err != nil {
+		t.Fatalf("resubmit: %v", err)
+	}
+	h, _ = svc.GetHandover("H001")
+	if h.Completed() || h.CompletedAt == nil || !h.CompletedAt.Equal(stale) {
+		t.Fatalf("退回与重新提交不应更新完成时间：%+v", h)
+	}
+	e2 = findEntryOf(t, h, "I002")
+	if e2.Status != EntryPending || e2.Operator != "" || e2.ProcessedAt != nil {
+		t.Fatalf("重新提交后应恢复待处理、当前处理信息显示尚未处理：%+v", e2)
+	}
+
+	// 19:00 确认 I002：仍有无法识别项，交接不完成、时间仍不动。
+	svc.nowAt(func() time.Time { return tsDay(2, 19, 0) })
+	if _, err := svc.ProcessEntry("H001", "I002", ActionConfirm, "李四", "", "", ""); err != nil {
+		t.Fatalf("confirm I002: %v", err)
+	}
+	h, _ = svc.GetHandover("H001")
+	if h.Completed() || !h.CompletedAt.Equal(stale) {
+		t.Fatalf("最后一项未接收前不能完成：%+v", h)
+	}
+
+	// 20:00 接收最后一项 I003：完成时间为这次成功处理的 20:00。
+	svc.nowAt(func() time.Time { return tsDay(2, 20, 0) })
+	if _, err := svc.ProcessEntry("H001", "I003", ActionTrack, "李四", "", "继续跟进", "王五"); err != nil {
+		t.Fatalf("track I003: %v", err)
+	}
+	h, _ = svc.GetHandover("H001")
+	want := tsDay(2, 20, 0)
+	if !h.Completed() || h.CompletedAt == nil || !h.CompletedAt.Equal(want) {
+		t.Fatalf("完成时间应为最后一次成功接收的 20:00，got %v", h.CompletedAt)
+	}
+}
+
+// legacyFullyReceivedNoCompletedAtRaw 构造一份清单已全部明确接收、但交接没有
+// 完成时间的旧记录，用于验证查询与重复发起都不能编造时刻。
+const legacyFullyReceivedNoCompletedAtRaw = `{
+  "shift_seq": 2, "item_seq": 2, "handover_seq": 1, "note_seq": 0,
+  "shifts": [
+    {"id":"S001","position":"调度","owner":"张三","start":"2026-10-02T08:00:00+08:00","end":"2026-10-02T16:00:00+08:00","created_at":"2026-10-02T08:00:00+08:00","closed":true,"closed_at":"2026-10-02T16:00:00+08:00"},
+    {"id":"S002","position":"调度","owner":"李四","start":"2026-10-02T16:00:00+08:00","end":"2026-10-02T23:00:00+08:00","created_at":"2026-10-02T08:00:00+08:00","closed":false}
+  ],
+  "items": [
+    {"id":"I001","origin_shift_id":"S001","shift_ids":["S001","S002"],"current_shift_id":"S002",
+     "content":"已确认事项","severity":"normal","follow_owner":"李四",
+     "created_at":"2026-10-02T09:00:00+08:00",
+     "events":[{"at":"2026-10-02T09:00:00+08:00","kind":"created","detail":"事项建立"}]},
+    {"id":"I002","origin_shift_id":"S001","shift_ids":["S001","S002"],"current_shift_id":"S002",
+     "content":"继续跟踪事项","severity":"important","follow_owner":"王五",
+     "created_at":"2026-10-02T09:10:00+08:00",
+     "events":[{"at":"2026-10-02T09:10:00+08:00","kind":"created","detail":"事项建立"}]}
+  ],
+  "handovers": [
+    {"id":"H001","position":"调度","from_shift_id":"S001","to_shift_id":"S002",
+     "created_at":"2026-10-02T10:00:00+08:00",
+     "entries":[
+       {"item_id":"I001","content":"已确认事项","severity":"normal","follow_owner":"李四",
+        "status":"confirmed","operator":"李四","processed_at":"2026-10-02T17:00:00+08:00"},
+       {"item_id":"I002","content":"继续跟踪事项","severity":"important","follow_owner":"王五",
+        "status":"tracking","operator":"李四","processed_at":"2026-10-02T17:30:00+08:00",
+        "tracking_note":"继续观察压力","follow_owner":"王五"}
+     ]}
+  ],
+  "notes": []
+}`
+
+// TestFullyReceivedLegacyWithoutCompletedAtNoFabrication：已经全部接收但缺少
+// 完成时间的旧记录，任何单纯查询都显示“未记录”，不编造时刻；重复发起返回原
+// 记录仍不补时间；接班班次可以正常结束，结束后完成时间依旧缺失。
+func TestFullyReceivedLegacyWithoutCompletedAtNoFabrication(t *testing.T) {
+	svc := openLegacyService(t, legacyFullyReceivedNoCompletedAtRaw)
+	svc.nowAt(func() time.Time { return tsDay(3, 9, 0) })
+
+	h, err := svc.GetHandover("H001")
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if !h.Completed() || h.CompletedAt != nil {
+		t.Fatalf("清单已全部接收但旧记录缺完成时间：%+v", h)
+	}
+	htext := FormatHandover(h)
+	if !strings.Contains(htext, "已完成 未记录") {
+		t.Fatalf("缺少完成时间应显示未记录，不能编造：\n%s", htext)
+	}
+	if strings.Contains(htext, "0001-01-01") {
+		t.Fatalf("不应出现公元元年日期：\n%s", htext)
+	}
+	// 各类查询后的事实一致。
+	j1, err := svc.ItemJourney("I001")
+	if err != nil {
+		t.Fatalf("journey: %v", err)
+	}
+	if !strings.Contains(FormatItemJourney(j1), "确认接收") {
+		t.Fatalf("事项经过仍应展示已保存的接收结果")
+	}
+	for _, shiftID := range []string{"S001", "S002"} {
+		rep, err := svc.ShiftReport(shiftID)
+		if err != nil {
+			t.Fatalf("report %s: %v", shiftID, err)
+		}
+		rtext := FormatReport(rep)
+		if !strings.Contains(rtext, "已完成 未记录") {
+			t.Fatalf("shift-show %s 也应显示完成时间未记录：\n%s", shiftID, rtext)
+		}
+	}
+
+	// 重复发起返回原记录，不补造完成时间。
+	again, err := svc.CreateHandover("S001", "S002")
+	if !errors.Is(err, ErrHandoverExists) || again.CompletedAt != nil {
+		t.Fatalf("重复发起应返回原记录且不编造完成时间：%v %+v", err, again)
+	}
+	h, _ = svc.GetHandover("H001")
+	if h.CompletedAt != nil {
+		t.Fatalf("重复发起后存储中仍不应出现完成时间：%+v", h.CompletedAt)
+	}
+
+	// 全接收的接班班次可以结束；结束不替交接补造完成时间。
+	if _, err := svc.CloseShift("S002"); err != nil {
+		t.Fatalf("全部接收后应能结束接班班次：%v", err)
+	}
+	h, _ = svc.GetHandover("H001")
+	if h.CompletedAt != nil {
+		t.Fatalf("结束班次也不能编造交接完成时间：%+v", h.CompletedAt)
+	}
+}
+
+// TestNormalCompletionTimeStable：正常逐项接收的交接，完成时间为最后一次成功
+// 接收的时间；此后已接收项无法再处理，完成时间保持不变。
+func TestNormalCompletionTimeStable(t *testing.T) {
+	f := newFixture(t)
+	a, b, items := prepareHandover(t, f)
+	h, _ := f.svc.CreateHandover(a.ID, b.ID)
+
+	t1 := tsDay(2, 17, 0)
+	t2 := tsDay(2, 18, 0)
+	f.svc.nowAt(func() time.Time { return t1 })
+	if _, err := f.svc.ProcessEntry(h.ID, items[0].ID, ActionConfirm, "李四", "", "", ""); err != nil {
+		t.Fatalf("confirm: %v", err)
+	}
+	got, _ := f.svc.GetHandover(h.ID)
+	if got.Completed() || got.CompletedAt != nil {
+		t.Fatalf("仍有一项待处理时不应完成或写完成时间")
+	}
+	f.svc.nowAt(func() time.Time { return t2 })
+	if _, err := f.svc.ProcessEntry(h.ID, items[1].ID, ActionTrack, "李四", "", "继续盯", "王五"); err != nil {
+		t.Fatalf("track: %v", err)
+	}
+	got, _ = f.svc.GetHandover(h.ID)
+	if !got.Completed() || got.CompletedAt == nil || !got.CompletedAt.Equal(t2) {
+		t.Fatalf("完成时间应为最后一次成功接收的 18:00，got %v", got.CompletedAt)
+	}
+
+	// 已接收项的任何重复处理都被拦截，完成时间不被改写。
+	f.svc.nowAt(func() time.Time { return tsDay(2, 20, 0) })
+	if _, err := f.svc.ProcessEntry(h.ID, items[0].ID, ActionConfirm, "王五", "", "", ""); !errors.Is(err, ErrHandoverState) {
+		t.Fatalf("已接收项不能重复处理，got %v", err)
+	}
+	if _, err := f.svc.ProcessEntry(h.ID, items[1].ID, ActionReturn, "王五", "退回", "", ""); !errors.Is(err, ErrHandoverState) {
+		t.Fatalf("已接收项不能退回，got %v", err)
+	}
+	got, _ = f.svc.GetHandover(h.ID)
+	if got.CompletedAt == nil || !got.CompletedAt.Equal(t2) {
+		t.Fatalf("正常完成时间应保持 18:00 不变，got %v", got.CompletedAt)
+	}
+}

@@ -192,11 +192,18 @@ type HandoverEntry struct {
 
 // Handover 是一个交班班次对接班班次发起的一次交接。
 type Handover struct {
-	ID          string          `json:"id"`
-	Position    string          `json:"position"`
-	FromShiftID string          `json:"from_shift_id"`
-	ToShiftID   string          `json:"to_shift_id"`
-	CreatedAt   time.Time       `json:"created_at"`
+	ID          string    `json:"id"`
+	Position    string    `json:"position"`
+	FromShiftID string    `json:"from_shift_id"`
+	ToShiftID   string    `json:"to_shift_id"`
+	CreatedAt   time.Time `json:"created_at"`
+	// CompletedAt 是整份交接真正接收齐全部事项的时刻。空清单在发起时即完成；
+	// 非空清单在最后一项被确认接收或继续跟踪、整份交接首次全部明确接收时，
+	// 以那次成功处理的时间为准。旧数据若在清单仍有结果缺失、无法识别、待处理
+	// 或退回项时误写过完成时间（或只留下零值），接班人逐项补齐、最后一项成功
+	// 接收时用本次处理时间覆盖旧时间，不沿用补齐前的时刻。单纯查询、补充后
+	// 重新提交与重复发起都不更新它，也不为已全部接收但缺少完成时间的旧记录
+	// 编造时刻。
 	CompletedAt *time.Time      `json:"completed_at,omitempty"`
 	Entries     []HandoverEntry `json:"entries"`
 }
