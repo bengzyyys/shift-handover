@@ -172,6 +172,13 @@ func FormatJourneyEvent(ev JourneyEvent) string {
 	case "return":
 		return fmt.Sprintf("%s %s第%d次退回 操作人=%s 原因=%s",
 			when, where, ev.RoundSeq, who, ev.Reason)
+	case "return-incomplete":
+		// 当前结果是退回却没有退回轮次记录：退回确实发生过，但轮次序号、
+		// 退回原因、补充与重新提交经过都没有可靠记录。处理人与时间各自使用
+		// 当前保存的信息（缺失分别标为未记录），并明确提示退回历史不完整、
+		// 原因未记录，不编造第几次退回，也不拿事项内容代替原因。
+		return fmt.Sprintf("%s %s退回 操作人=%s（退回历史不完整：缺少退回轮次记录，退回原因未记录）",
+			when, where, who)
 	case "resubmit":
 		return fmt.Sprintf("%s %s第%d次重新提交 补充说明=%s 补充人=%s 补充时间=%s",
 			when, where, ev.RoundSeq, dashIfEmpty(ev.Supplement),

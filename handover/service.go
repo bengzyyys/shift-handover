@@ -811,6 +811,11 @@ func (svc *Service) GetItem(id string) (Item, error) {
 // ItemJourney 凭事项编号汇总它从建立到当前的处理经过：保留事项自身的
 // 建立、修改、关闭记录，并加入它参与的各次交接（发起交接、逐轮退回、补充后
 // 重新提交、确认接收或继续跟踪），无须先知道涉及哪些交接编号。
+// 当前保存的处理结果是退回、却没有任何退回轮次记录时（旧数据缺失），仍在时间线
+// 中呈现这次已发生的退回，处理人与处理时间各自使用该项当前保存的信息（缺失分别
+// 标为未记录），并标明退回历史不完整、原因未记录；不编造轮次序号、原因、补充或
+// 重新提交经过，也不拿交接发起时间补齐处理时间。待处理、确认接收、继续跟踪、
+// 结果缺失或无法识别的记录不据残留的处理人与时间认定发生退回。
 // 经过按实际发生时刻排序（带不同时区的时间按同一实际时刻比较）；同一时刻下
 // 同一交接内保持发起、该轮退回、该轮重新提交、后续处理的先后，不同交接按
 // 交接编号排列。同一次接收若已出现在事项历史里只展示一次：除操作人与实际
@@ -888,6 +893,22 @@ func (svc *Service) ItemJourney(itemID string) (ItemJourney, error) {
 					SupplementOperator: r.SupplementOperator, SupplementAt: r.SupplementAt,
 				}, h.ID)
 			}
+		}
+		if e.Status == EntryReturned && len(e.Rounds) == 0 {
+			// 当前保存的结果是退回，却没有任何退回轮次记录（旧数据缺失）：
+			// 退回确实发生过，处理经过必须呈现这一事实，不能像没发生过退回一样
+			// 只列发起交接；但原因、轮次序号、补充与重新提交经过都没有可靠记录，
+			// 只能使用该项当前保存的处理人与处理时间，并标明退回历史不完整。
+			// 不编造第几次退回或退回原因，也不拿交接发起时间补齐处理时间。
+			ev := JourneyEvent{
+				Kind: "return-incomplete", Operator: e.Operator,
+				HandoverID: h.ID, FromShift: h.FromShiftID, ToShift: h.ToShiftID,
+				HistoryIncomplete: true,
+			}
+			if validProcessedAt(e.ProcessedAt) {
+				ev.At, ev.TimeKnown = *e.ProcessedAt, true
+			}
+			add(ev, h.ID)
 		}
 		if e.Status.Received() {
 			kind := "confirm"

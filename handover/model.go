@@ -238,10 +238,14 @@ type OverlapNote struct {
 type JourneyEvent struct {
 	At                 time.Time  // 实际发生时刻；TimeKnown 为 false 表示未记录
 	TimeKnown          bool       // At 是否有效（旧数据可能缺时间）
-	Kind               string     // created/updated/closed/received/handover-init/return/resubmit/confirm/track
+	Kind               string     // created/updated/closed/received/handover-init/return/return-incomplete/resubmit/confirm/track
 	Operator           string     // 实际操作人；空表示未记录
 	Detail             string     // 事项自身事件附带的说明
-	HandoverID         string     // 交接相关事件所属的交接编号
+	// HistoryIncomplete 表示该事件由当前保存的处理结果推断而来（当前结果是退回
+	// 却没有任何退回轮次记录）：退回确实发生过，但原因与轮次详情没有可靠记录，
+	// 只展示当前保存的处理人与处理时间，并明确提示退回历史不完整。
+	HistoryIncomplete bool
+	HandoverID        string // 交接相关事件所属的交接编号
 	FromShift          string     // 交班班次
 	ToShift            string     // 接班班次
 	RoundSeq           int        // 退回/重新提交的轮次
