@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/bengzyyys/shift-handover/handover"
@@ -60,20 +61,7 @@ const usageText = `用法：handover [--data 文件] <命令> [参数]
 
 func run(argv []string, stdout, stderr io.Writer) int {
 	args := append([]string(nil), argv...)
-	dataPath := os.Getenv("HANDOVER_DATA")
-	// 抽出全局 --data。
-	rest := make([]string, 0, len(args))
-	for i := 0; i < len(args); i++ {
-		switch {
-		case args[i] == "--data" && i+1 < len(args):
-			dataPath = args[i+1]
-			i++
-		case len(args[i]) > 7 && args[i][:7] == "--data=":
-			dataPath = args[i][7:]
-		default:
-			rest = append(rest, args[i])
-		}
-	}
+	dataPath, rest := splitDataFlag(args, os.Getenv("HANDOVER_DATA"))
 	if dataPath == "" {
 		dataPath = "handover-data.json"
 	}
@@ -103,6 +91,56 @@ func run(argv []string, stdout, stderr io.Writer) int {
 		}
 	}
 	return 0
+}
+
+// valueFlags 是各子命令会带一个值的字符串参数。提取全局 --data 时，
+// 这些参数后面的一个 token 是它的值：即使恰好写成 --data 或 --data=...，
+// 也只是参数值（如事项内容、限制条件），不能当作数据文件参数取走。
+var valueFlags = map[string]bool{
+	"id": true, "position": true, "owner": true, "start": true, "end": true,
+	"a": true, "b": true, "note": true, "shift": true, "content": true,
+	"severity": true, "constraints": true, "follow": true, "operator": true,
+	"from": true, "to": true, "item": true, "action": true, "reason": true,
+	"supplement": true,
+}
+
+// splitDataFlag 从全部输入中抽出全局 --data（--data 路径 与 --data=路径 两种
+// 形式，命令前后均可），返回数据文件路径与其余参数。已知参数的 --name value
+// 形式中，value 原样保留，不参与 --data 判定；env 为未显式指定时的回退值。
+func splitDataFlag(args []string, env string) (dataPath string, rest []string) {
+	dataPath = env
+	rest = make([]string, 0, len(args))
+	for i := 0; i < len(args); i++ {
+		arg := args[i]
+		if name, ok := flagName(arg); ok && name != "data" && valueFlags[name] {
+			// 其他参数的 --name value 形式：下一个 token 是它的值，原样保留。
+			rest = append(rest, arg)
+			if i+1 < len(args) {
+				rest = append(rest, args[i+1])
+				i++
+			}
+			continue
+		}
+		switch {
+		case arg == "--data" && i+1 < len(args):
+			dataPath = args[i+1]
+			i++
+		case len(arg) > 7 && arg[:7] == "--data=":
+			dataPath = arg[7:]
+		default:
+			rest = append(rest, arg)
+		}
+	}
+	return dataPath, rest
+}
+
+// flagName 解析 -name / --name 形式的参数名；带 = 的形式值已内联，返回 false。
+func flagName(arg string) (string, bool) {
+	if !strings.HasPrefix(arg, "-") || strings.Contains(arg, "=") {
+		return "", false
+	}
+	name := strings.TrimLeft(arg, "-")
+	return name, name != ""
 }
 
 func dispatch(svc *handover.Service, cmd string, args []string) (string, error) {
