@@ -105,6 +105,27 @@ func fmtProcessedAtIfRecorded(t *time.Time) string {
 	return fmtTime(*t)
 }
 
+// currentProcessing 返回交接单项当前处理结果的处理人与处理时间展示，是
+// 交接清单（handover-show、shift-show 内嵌清单与末尾结果说明）和事项处理
+// 经过查询（item-show）共用的同一条业务规则。
+//
+// 是否处理过以已保存的处理结果（状态）为准，与处理时间是否保存无关：确认
+// 接收、继续跟踪与退回都属于已经发生的处理，缺少处理时间不能使它们变成待
+// 处理；真正待处理（含退回后已补充重新提交、等待接班人再次处理）的事项，
+// 处理人与处理时间都显示尚未处理，即使旧记录残留姓名或时间也不显示成已处理。
+//
+// 已处理时处理人与处理时间各自独立展示：人名有值展示原姓名、缺失明确标为
+// 未记录；时间有真实值沿用带时区格式、缺失或为旧数据零值
+// （0001-01-01T00:00:00Z）同样标为未记录。缺少其中一个不能隐藏另一个，
+// 也不以班次负责人、交接发起时间或退回历史中的信息代替。结果为空或无法
+// 识别的记录同样按各自已保存的姓名与时间展示，不据以推测接收结果。
+func currentProcessing(e HandoverEntry) (operator, processedAt string) {
+	if e.Status == EntryPending {
+		return "尚未处理", "尚未处理"
+	}
+	return whoIfRecorded(e.Operator), fmtProcessedAtIfRecorded(e.ProcessedAt)
+}
+
 // entryCurrentResultLabel 是交接当前结果在事项处理经过查询中的展示名。
 // 缺失或空结果显示“处理结果未记录”，无法识别的结果显示“处理结果无法识别”
 // 并带出保存的原值，与交接清单、班次报告表达同一事实，不推测成已接收。
@@ -184,14 +205,8 @@ func FormatItemJourney(j ItemJourney) string {
 		b.WriteString("    暂无交接记录\n")
 	}
 	for _, r := range j.Results {
-		operator, processedAt := "尚未处理", "尚未处理"
-		if r.Entry.Status != EntryPending {
-			// 已有处理结果（确认接收/继续跟踪/退回）时如实展示：处理人与
-			// 处理时间各自独立，缺失的明确标为未记录，不连带隐藏已保存的
-			// 处理人，也不把已处理结果显示成尚未处理。
-			operator = whoIfRecorded(r.Entry.Operator)
-			processedAt = fmtProcessedAtIfRecorded(r.Entry.ProcessedAt)
-		}
+		// 处理人与处理时间沿用共用的当前处理展示规则（见 currentProcessing）。
+		operator, processedAt := currentProcessing(r.Entry)
 		fmt.Fprintf(&b, "    交接 %s（%s -> %s）当前结果：%s；处理人=%s；处理时间=%s\n",
 			r.HandoverID, r.FromShift, r.ToShift,
 			entryCurrentResultLabel(r.Entry.Status), operator, processedAt)
@@ -236,17 +251,14 @@ func FormatEntry(e HandoverEntry) string {
 		e.ItemID, e.Status.Label(), e.Severity.Label(), e.FollowOwner)
 	fmt.Fprintf(&b, "  原文：%s\n", e.Content)
 	fmt.Fprintf(&b, "  限制条件：%s\n", dashIfEmpty(e.Constraints))
-	// 是否处理过以已保存的处理结果为准，不以处理时间是否保存为准：确认接收、
-	// 继续跟踪与退回都属于已经发生的处理。处理人与处理时间各自独立展示，缺少
-	// 其中一个不能隐藏另一个：人名缺失明确标为未记录，时间缺失或为旧数据零值
-	// （0001-01-01T00:00:00Z）同样标为未记录，不以班次负责人、交接发起时间或
-	// 退回历史中的时间代替；真正待处理（含退回后已补充重新提交、等待接班人再次
-	// 处理）的事项才显示尚未处理。
+	// 处理人与处理时间沿用共用的当前处理展示规则（见 currentProcessing）；
+	// 待处理项在此额外说明等待接班人处理。
+	operator, processedAt := currentProcessing(e)
 	if e.Status == EntryPending {
-		b.WriteString("  最后处理：尚未处理（等待接班人处理）；处理人=尚未处理；处理时间=尚未处理\n")
+		fmt.Fprintf(&b, "  最后处理：尚未处理（等待接班人处理）；处理人=%s；处理时间=%s\n",
+			operator, processedAt)
 	} else {
-		fmt.Fprintf(&b, "  最后处理：处理人=%s；处理时间=%s\n",
-			whoIfRecorded(e.Operator), fmtProcessedAtIfRecorded(e.ProcessedAt))
+		fmt.Fprintf(&b, "  最后处理：处理人=%s；处理时间=%s\n", operator, processedAt)
 	}
 	if e.Status == EntryTracking || e.TrackingNote != "" {
 		fmt.Fprintf(&b, "  跟踪说明：%s\n", dashIfEmpty(e.TrackingNote))
@@ -357,16 +369,9 @@ func FormatReport(rep ShiftReport) string {
 	for _, id := range ids {
 		views := rep.Results[id]
 		for _, v := range views {
-			// 是否处理过以已保存的处理结果（状态）为准，与处理时间是否保存
-			// 无关：确认接收、继续跟踪、退回都算已处理。处理人与处理时间
-			// 分别独立展示，缺失的明确标为未记录，不用另一方或退回历史中的
-			// 信息代替；真正待处理（含退回后补充重新提交、等待接班人再次
-			// 处理）的事项才显示尚未处理。
-			operator, processedAt := "尚未处理", "尚未处理"
-			if v.Entry.Status != EntryPending {
-				operator = whoIfRecorded(v.Entry.Operator)
-				processedAt = fmtProcessedAtIfRecorded(v.Entry.ProcessedAt)
-			}
+			// 处理人与处理时间沿用共用的当前处理展示规则（见
+			// currentProcessing），与内嵌交接清单表达同一事实。
+			operator, processedAt := currentProcessing(v.Entry)
 			fmt.Fprintf(&b, "  事项 %s 交接 %s（%s -> %s）当前结果：%s；处理人=%s；处理时间=%s\n",
 				id, v.HandoverID, v.FromShift, v.ToShift,
 				v.Entry.Status.Label(), operator, processedAt)
