@@ -11,16 +11,17 @@ import (
 // 是只读逻辑，不改变任何已保存数据，也不改变接班操作与数据格式。
 
 // 事项历史中的接收说明模板。新写入的 received 事件用交接编号、交班、接班班次
-// 与接收方式完整标注；item-show 合并接收记录时依据这些明确记载判定同一次接收，
-// 不能仅凭操作人与时刻合并。模板为固定格式，parseReceivedDetail 据其解析。
+// 与接收方式完整标注；item-show 合并接收记录时要求这些归属信息全部明确记载且
+// 与交接清单一致，不能仅凭操作人与时刻合并，也不能只靠部分信息吻合。模板为
+// 固定格式，parseReceivedDetail 据其解析。
 const (
 	receivedDetailPrefix = "交接 "
 	receivedDetailMid    = "（"
 	receivedDetailArrow  = " -> "
 	receivedDetailTail   = "）接班班次接收："
 	// 旧版本写入的说明只明确记载接班班次与接收方式，没有交接编号与交班班次，
-	// 例如“接班班次 S002 接收：确认接收”。其中明确记载的事实仍可用于比对，
-	// 未记载的字段不比较，更不凭空补齐。
+	// 例如“接班班次 S002 接收：确认接收”。缺少归属信息的旧说明不能认定为
+	// 某次交接的接收，一律作为独立接收历史保留，不替它补交接编号或交班班次。
 	legacyReceivedPrefix = "接班班次 "
 	legacyReceivedTail   = " 接收："
 )
@@ -37,7 +38,8 @@ func receivedDetailText(h *Handover, action EntryAction, statusLabel, trackingNo
 }
 
 // receivedAttribution 是从接收说明中明确解析出的归属信息。空字符串表示该
-// 说明没有明确记载这一项，比对时不得据此判断一致或矛盾。
+// 说明没有明确记载这一项；合并要求四项全部明确记载，任一缺失即不能认定为
+// 同一次接收（解析仍如实提取已记载的部分，不凭空补全）。
 type receivedAttribution struct {
 	handoverID string
 	fromShift  string
@@ -134,16 +136,19 @@ func receiptFromEntry(h *Handover, e *HandoverEntry) receivedReceipt {
 }
 
 // sameReceivedEvent 判定一条事项自身 received 事件与一次交接接收是否同一次
-// 接收。依据只来自已记载的事实：
+// 接收。只有能够明确认定的两条记录才合并，依据只来自已记载的事实：
 //   - 操作人相同、实际发生时刻相同（time.Time.Equal 按同一实际时刻比较，
 //     不同时区写法表示同一时刻仍视为相同）；
-//   - 接收说明必须是本工具写入的固定格式（新格式或旧格式），自由文字或残缺
-//     说明无法确认归属，一律不合并且不补字段；
-//   - 说明中明确记载的交接编号、交班、接班班次与接收方式，逐项与凭据一致或
-//     未记载（旧格式没有交接编号与交班班次，不要求补齐）；明确指向其他交接、
-//     其他班次或另一种接收方式即为矛盾，保留原记录。
+//   - 接收说明必须是本工具写入的完整固定格式，明确记载交接编号、交班班次、
+//     接班班次与接收方式，且四项都与凭据一致；自由文字或残缺说明无法确认
+//     归属，一律不合并且不补字段；
+//   - 旧格式说明（“接班班次 S002 接收：…”）没有明确记载交接编号与交班班次，
+//     即使接班班次与接收方式恰好吻合，也只是部分信息相符，不能认定为同一
+//     次接收：旧说明作为独立接收历史原样保留，不替它补交接编号或交班班次；
+//   - 明确记载的交接编号、任一班次或接收方式不同即为矛盾，保留原记录。
 //
-// 不能只因操作人相同，或事项当前处于接班班次，就认定为同一次接收。
+// 不能只因操作人相同、部分信息吻合，或事项当前处于接班班次，就认定为同一次
+// 接收。
 func sameReceivedEvent(iev ItemEvent, rcpt receivedReceipt) bool {
 	if iev.Kind != "received" || !iev.At.Equal(rcpt.at) || iev.Operator != rcpt.operator {
 		return false
@@ -152,20 +157,24 @@ func sameReceivedEvent(iev ItemEvent, rcpt receivedReceipt) bool {
 	if !ok {
 		return false
 	}
-	return (attr.handoverID == "" || attr.handoverID == rcpt.handoverID) &&
-		(attr.fromShift == "" || attr.fromShift == rcpt.fromShift) &&
-		(attr.toShift == "" || attr.toShift == rcpt.toShift) &&
-		(attr.kind == "" || attr.kind == rcpt.kind)
+	// 四项归属信息都必须明确记载且与凭据一致。旧格式解析出的 handoverID 与
+	// fromShift 为空，而凭据中它们恒非空，直接比较即自然排除旧格式说明，
+	// 无须也不允许按“未记载不比较”放行。
+	return attr.handoverID == rcpt.handoverID &&
+		attr.fromShift == rcpt.fromShift &&
+		attr.toShift == rcpt.toShift &&
+		attr.kind == rcpt.kind
 }
 
 // receivedMerge 在遍历各次交接清单时记录事项自身 received 事件中哪些与某次
 // 交接接收同属一次。匹配后该事项事件在时间线中只以信息更全的交接事件展示；
 // 未匹配的 received 事件由调用方原样保留。
 //
-// 一条事项事件至多匹配一次，一次交接接收至多匹配一条事项事件。逐条按事项
-// 事件的保存顺序取第一条全部事实相符的记录，因此调换两条历史的保存顺序
-// 不会改变结果：指向其他交接/班次/方式的记录会被跳过，继续寻找真正同一次
-// 的记录，而不是隐藏它。
+// 一条事项事件至多匹配一次，一次交接接收至多匹配一条事项事件。只有完整记载
+// 且全部一致的记录才参与匹配：缺少归属信息的旧说明、指向其他交接/班次/方式
+// 的说明都不会被认领，因此调换两条历史的保存顺序不会改变结果——当一条旧说明
+// 与一条完整说明都与同一清单记录部分吻合时，被合并的始终是完整对应的那一条，
+// 旧说明始终保留，与存放先后无关。
 type receivedMerge struct {
 	matched []bool
 	events  []ItemEvent

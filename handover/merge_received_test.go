@@ -130,8 +130,8 @@ func TestItemJourneyMergeReceptionSameOperatorSameTime(t *testing.T) {
 }
 
 // TestItemJourneyMergeReceptionDistinguishingFacts：记载的接收方式、交接编号
-// 不同，或说明根本没有明确归属信息时，事项历史各自保留；记载一致（含旧版本
-// 格式、不同时区表示同一时刻）时才合并为同一次接收。
+// 不同，说明根本没有明确归属信息，或旧格式缺少交接编号与交班班次时，事项历史
+// 各自保留；只有完整记载且一致（含不同时区表示同一时刻）才合并为同一次接收。
 func TestItemJourneyMergeReceptionDistinguishingFacts(t *testing.T) {
 	cases := []struct {
 		name           string
@@ -142,7 +142,7 @@ func TestItemJourneyMergeReceptionDistinguishingFacts(t *testing.T) {
 		{"记载接收方式不同", canonicalConfirmToB, `"2026-10-02T11:00:00+08:00"`, 1},
 		{"说明无明确归属信息", freeTextReceive, `"2026-10-02T11:00:00+08:00"`, 1},
 		{"记载另一个交接编号", otherHandoverTrack, `"2026-10-02T11:00:00+08:00"`, 1},
-		{"旧格式记载一致应合并", legacyTrackToB, `"2026-10-02T11:00:00+08:00"`, 0},
+		{"旧格式缺少交接编号与交班班次不合并", legacyTrackToB, `"2026-10-02T11:00:00+08:00"`, 1},
 		{"新格式记载一致应合并", canonicalTrackToB, `"2026-10-02T11:00:00+08:00"`, 0},
 		{"不同时区同一时刻应合并", canonicalTrackToBTZ, `"2026-10-02T11:00:00+08:00"`, 0},
 	}
@@ -158,6 +158,60 @@ func TestItemJourneyMergeReceptionDistinguishingFacts(t *testing.T) {
 			}
 			if got := countKind(j.Events, "received"); got != tc.wantStandalone {
 				t.Fatalf("事项自身接收记录保留条数 want %d, got %d：%v", tc.wantStandalone, got, journeyKinds(j))
+			}
+		})
+	}
+}
+
+// TestItemJourneyMergeReceptionLegacyKeptAlongsideCanonical：同一事项同时保存
+// 一条缺少归属信息的旧说明与一条完整对应 H001 的说明时，只合并完整对应的那条；
+// 旧说明作为独立接收历史保留原文、原操作人与原时间，不替它补交接编号或交班
+// 班次。交换两条说明的保存顺序必须得到相同的记录内容与条数。
+func TestItemJourneyMergeReceptionLegacyKeptAlongsideCanonical(t *testing.T) {
+	for _, order := range []struct{ name, events string }{
+		{"旧说明在前", legacyTrackToB + canonicalTrackToB},
+		{"旧说明在后", canonicalTrackToB + legacyTrackToB},
+	} {
+		t.Run(order.name, func(t *testing.T) {
+			svc := openLegacyService(t, journeyMergeRaw(order.events, `"2026-10-02T11:00:00+08:00"`))
+			j, err := svc.ItemJourney("I001")
+			if err != nil {
+				t.Fatalf("journey: %v", err)
+			}
+			if countKind(j.Events, "track") != 1 {
+				t.Fatalf("交给乙班的继续跟踪应只展示一次：%v", journeyKinds(j))
+			}
+			if countKind(j.Events, "received") != 1 {
+				t.Fatalf("旧说明应作为独立接收历史保留一条：%v", journeyKinds(j))
+			}
+			var standalone *JourneyEvent
+			for i := range j.Events {
+				if j.Events[i].Kind == "received" {
+					standalone = &j.Events[i]
+				}
+			}
+			if standalone == nil ||
+				!strings.Contains(standalone.Detail, "接班班次 S002 接收：继续跟踪") {
+				t.Fatalf("保留的应是旧说明原文：%+v", standalone)
+			}
+			if standalone.Operator != "李四" || !standalone.TimeKnown ||
+				standalone.At.Format("2006-01-02 15:04") != "2026-10-02 11:00" {
+				t.Fatalf("旧说明应保留原操作人与原时间：%+v", standalone)
+			}
+			if standalone.HandoverID != "" || standalone.FromShift != "" || standalone.ToShift != "" {
+				t.Fatalf("缺少归属信息的旧说明不能凭空补交接编号或班次字段：%+v", standalone)
+			}
+
+			text := FormatItemJourney(j)
+			if !strings.Contains(text, "接班班次 S002 接收：继续跟踪") {
+				t.Fatalf("展示应完整保留旧说明原文：\n%s", text)
+			}
+			if strings.Count(text, "交接 H001（S001 -> S002）继续跟踪") != 1 {
+				t.Fatalf("交接清单中的继续跟踪应照常展示一次：\n%s", text)
+			}
+			if !strings.Contains(text, "跟踪说明=每两小时记录压力") ||
+				!strings.Contains(text, "后续负责人=王五") {
+				t.Fatalf("继续跟踪应带出当时保存的跟踪说明与后续负责人：\n%s", text)
 			}
 		})
 	}

@@ -764,8 +764,8 @@ func (svc *Service) ItemJourney(itemID string) (ItemJourney, error) {
 
 	// 接收记录的合并判定集中在 receivedMerge（见 received_merge.go）：遍历各次
 	// 交接清单时标记与某次接收同属一次的事项 received 事件，该事件随后只以信息
-	// 更全的交接事件展示。未标记的 received 事件（说明指向其他交接/班次/方式、
-	// 自由文字或残缺说明等）在下面原样保留。
+	// 更全的交接事件展示。未标记的 received 事件（缺少归属信息的旧说明、说明
+	// 指向其他交接/班次/方式、自由文字或残缺说明等）在下面原样保留。
 	merge := newReceivedMerge(it.Events)
 
 	hs := append([]Handover(nil), d.Handovers...)
@@ -840,8 +840,8 @@ func (svc *Service) ItemJourney(itemID string) (ItemJourney, error) {
 			}
 			add(ev, h.ID)
 			// 标记与本次接收同属一次的事项 received 事件；合并依据全部在
-			// sameReceivedEvent 中：操作人与实际时刻相同，且说明明确记载的
-			// 交接编号、两班、接收方式无冲突。
+			// sameReceivedEvent 中：操作人与实际时刻相同，且说明完整记载
+			// 交接编号、两班、接收方式并与本凭据一致。
 			merge.consider(rcpt)
 		}
 	}
