@@ -5,6 +5,7 @@ import (
 	"os"
 	"strings"
 	"testing"
+	"time"
 )
 
 // 合并接收记录场景共用的旧数据：H001 由甲班 S001 交给乙班 S002，接班人李四
@@ -129,9 +130,10 @@ func TestItemJourneyMergeReceptionSameOperatorSameTime(t *testing.T) {
 	}
 }
 
-// TestItemJourneyMergeReceptionDistinguishingFacts：记载的接收方式、交接编号
-// 不同，或说明根本没有明确归属信息时，事项历史各自保留；记载一致（含旧版本
-// 格式、不同时区表示同一时刻）时才合并为同一次接收。
+// TestItemJourneyMergeReceptionDistinguishingFacts：只有完整记载交接编号、两班
+// 与接收方式且与清单一致（含不同时区表示同一时刻）的说明才合并；旧版本格式
+// 即使接班班次与方式都吻合，也因缺少交接编号与交班班次而独立保留；记载的
+// 接收方式、交接编号不同，或说明根本没有明确归属信息时同样各自保留。
 func TestItemJourneyMergeReceptionDistinguishingFacts(t *testing.T) {
 	cases := []struct {
 		name           string
@@ -142,7 +144,7 @@ func TestItemJourneyMergeReceptionDistinguishingFacts(t *testing.T) {
 		{"记载接收方式不同", canonicalConfirmToB, `"2026-10-02T11:00:00+08:00"`, 1},
 		{"说明无明确归属信息", freeTextReceive, `"2026-10-02T11:00:00+08:00"`, 1},
 		{"记载另一个交接编号", otherHandoverTrack, `"2026-10-02T11:00:00+08:00"`, 1},
-		{"旧格式记载一致应合并", legacyTrackToB, `"2026-10-02T11:00:00+08:00"`, 0},
+		{"旧格式即使接班班次与方式一致也不合并", legacyTrackToB, `"2026-10-02T11:00:00+08:00"`, 1},
 		{"新格式记载一致应合并", canonicalTrackToB, `"2026-10-02T11:00:00+08:00"`, 0},
 		{"不同时区同一时刻应合并", canonicalTrackToBTZ, `"2026-10-02T11:00:00+08:00"`, 0},
 	}
@@ -162,6 +164,80 @@ func TestItemJourneyMergeReceptionDistinguishingFacts(t *testing.T) {
 		})
 	}
 }
+
+// TestItemJourneyMergeReceptionLegacyAndFullSameHandover：这是本次修正的核心
+// 场景。同一事项既保存了一条旧说明（“接班班次 S002 接收：继续跟踪…”，缺
+// 交接编号与交班班次），又保存了那次交接的完整接收说明。两条都与 H001 清单
+// 部分或完全吻合、操作人与时刻相同：
+//   - 只允许合并归属信息完整、逐项一致的那一条，清单接收在处理经过中只展示
+//     一次，并带出交接编号、两班关系、接收方式、当时的跟踪说明与后续负责人；
+//   - 旧说明归属信息不完整，必须作为独立接收历史保留原文、原操作人与原时间，
+//     不替它补交接编号或交班班次；
+//   - 交换两条说明的保存顺序，得到的记录内容与条数完全相同，不由存放先后决定。
+func TestItemJourneyMergeReceptionLegacyAndFullSameHandover(t *testing.T) {
+	for _, order := range []struct{ name, events string }{
+		{"旧说明在前", legacyTrackToB + canonicalTrackToB},
+		{"旧说明在后", canonicalTrackToB + legacyTrackToB},
+	} {
+		t.Run(order.name, func(t *testing.T) {
+			svc := openLegacyService(t, journeyMergeRaw(order.events, `"2026-10-02T11:00:00+08:00"`))
+			j, err := svc.ItemJourney("I001")
+			if err != nil {
+				t.Fatalf("journey: %v", err)
+			}
+			if countKind(j.Events, "track") != 1 {
+				t.Fatalf("H001 的继续跟踪应只展示一次：%v", journeyKinds(j))
+			}
+			if countKind(j.Events, "confirm") != 0 {
+				t.Fatalf("不应出现确认接收事件：%v", journeyKinds(j))
+			}
+			if got := countKind(j.Events, "received"); got != 1 {
+				t.Fatalf("归属不完整的旧说明应独立保留一条，got %d：%v", got, journeyKinds(j))
+			}
+			var standalone *JourneyEvent
+			for i := range j.Events {
+				if j.Events[i].Kind == "received" {
+					standalone = &j.Events[i]
+				}
+			}
+			if standalone == nil || standalone.Detail != legacyTrackToBDetail {
+				t.Fatalf("保留的应是旧说明原文，got：%+v", standalone)
+			}
+			if standalone.Operator != "李四" || !standalone.TimeKnown {
+				t.Fatalf("旧说明应保留原操作人与真实时间：%+v", standalone)
+			}
+			wantAt, err := time.Parse(time.RFC3339, "2026-10-02T11:00:00+08:00")
+			if err != nil {
+				t.Fatalf("parse want time: %v", err)
+			}
+			if !standalone.At.Equal(wantAt) {
+				t.Fatalf("旧说明应保留原实际时刻 %v，got %v", wantAt, standalone.At)
+			}
+			if standalone.HandoverID != "" || standalone.FromShift != "" || standalone.ToShift != "" {
+				t.Fatalf("不能替旧说明补交接编号或交班/接班班次：%+v", standalone)
+			}
+
+			text := FormatItemJourney(j)
+			if strings.Count(text, "接班班次 S002 接收：继续跟踪") != 1 {
+				t.Fatalf("旧说明原文应只出现一次：\n%s", text)
+			}
+			if strings.Count(text, "交接 H001（S001 -> S002）继续跟踪") != 1 {
+				t.Fatalf("清单中的继续跟踪应只出现一次：\n%s", text)
+			}
+			if !strings.Contains(text, "跟踪说明=每两小时记录压力") ||
+				!strings.Contains(text, "后续负责人=王五") {
+				t.Fatalf("继续跟踪应带出当时保存的跟踪说明与后续负责人王五：\n%s", text)
+			}
+			if len(j.Results) != 1 || j.Results[0].HandoverID != "H001" ||
+				j.Results[0].Entry.Status != EntryTracking {
+				t.Fatalf("各次交接当前结果应保持不变：%+v", j.Results)
+			}
+		})
+	}
+}
+
+// legacyTrackToBDetail 与 legacyTrackToB 注入 JSON 中的说明文本保持一致。
+const legacyTrackToBDetail = "接班班次 S002 接收：继续跟踪；跟踪说明：每两小时记录压力；后续负责人：王五"
 
 // TestItemJourneyMergeReceptionDoesNotRewrite：单纯查询不改写任何历史、不移动
 // 事项、不改变交接完成情况。
