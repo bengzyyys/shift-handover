@@ -2,6 +2,7 @@ package main
 
 import (
 	"reflect"
+	"strings"
 	"testing"
 )
 
@@ -12,6 +13,7 @@ func TestSplitDataFlag(t *testing.T) {
 		env      string
 		wantPath string
 		wantRest []string
+		wantErr  string
 	}{
 		{
 			name:     "内容恰为 --data=文件 时仍写入显式指定的数据文件",
@@ -69,10 +71,50 @@ func TestSplitDataFlag(t *testing.T) {
 			wantPath: "",
 			wantRest: []string{"item-add", "--shift=S001", "--content=--data=乙.json", "--severity=normal", "--follow=李四"},
 		},
+		{
+			name:    "命令前 --data 空字符串",
+			args:    []string{"--data", "", "shift-list"},
+			wantErr: "数据文件路径不能为空",
+		},
+		{
+			name:    "命令后 --data 空字符串",
+			args:    []string{"shift-list", "--data", ""},
+			wantErr: "数据文件路径不能为空",
+		},
+		{
+			name:    "--data 空字符串时不回退环境变量",
+			args:    []string{"--data", "", "shift-list"},
+			env:     "env.json",
+			wantErr: "数据文件路径不能为空",
+		},
+		{
+			name:    "命令前 --data= 无内容",
+			args:    []string{"--data=", "shift-list"},
+			wantErr: "数据文件路径不能为空",
+		},
+		{
+			name:    "命令后 --data= 无内容",
+			args:    []string{"shift-list", "--data="},
+			wantErr: "数据文件路径不能为空",
+		},
+		{
+			name:    "末尾独立 --data 缺少路径",
+			args:    []string{"shift-list", "--data"},
+			wantErr: "缺少数据文件路径",
+		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			path, rest := splitDataFlag(tc.args, tc.env)
+			path, rest, err := splitDataFlag(tc.args, tc.env)
+			if tc.wantErr != "" {
+				if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+					t.Fatalf("err = %v，期望包含 %q", err, tc.wantErr)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("err = %v，期望无错误", err)
+			}
 			if path != tc.wantPath {
 				t.Errorf("dataPath = %q，期望 %q", path, tc.wantPath)
 			}

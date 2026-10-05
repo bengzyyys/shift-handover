@@ -61,7 +61,13 @@ const usageText = `用法：handover [--data 文件] <命令> [参数]
 
 func run(argv []string, stdout, stderr io.Writer) int {
 	args := append([]string(nil), argv...)
-	dataPath, rest := splitDataFlag(args, os.Getenv("HANDOVER_DATA"))
+	dataPath, rest, err := splitDataFlag(args, os.Getenv("HANDOVER_DATA"))
+	if err != nil {
+		// 显式指定了 --data 却没给出有效路径：直接失败，不回退到
+		// 环境变量或默认文件，也不打开/创建任何数据文件。
+		fmt.Fprintf(stderr, "错误：%v\n", err)
+		return 1
+	}
 	if dataPath == "" {
 		dataPath = "handover-data.json"
 	}
@@ -107,7 +113,10 @@ var valueFlags = map[string]bool{
 // splitDataFlag 从全部输入中抽出全局 --data（--data 路径 与 --data=路径 两种
 // 形式，命令前后均可），返回数据文件路径与其余参数。已知参数的 --name value
 // 形式中，value 原样保留，不参与 --data 判定；env 为未显式指定时的回退值。
-func splitDataFlag(args []string, env string) (dataPath string, rest []string) {
+// 显式给出 --data 却没有有效路径（空字符串、--data= 后无内容、末尾独立
+// --data 后没有值）时返回错误：此时不能按未指定处理，调用方不得回退到
+// env 或默认文件继续执行。
+func splitDataFlag(args []string, env string) (dataPath string, rest []string, err error) {
 	dataPath = env
 	rest = make([]string, 0, len(args))
 	for i := 0; i < len(args); i++ {
@@ -122,16 +131,25 @@ func splitDataFlag(args []string, env string) (dataPath string, rest []string) {
 			continue
 		}
 		switch {
-		case arg == "--data" && i+1 < len(args):
+		case arg == "--data":
+			if i+1 >= len(args) {
+				return "", nil, errors.New("--data 后缺少数据文件路径")
+			}
+			if args[i+1] == "" {
+				return "", nil, errors.New("--data 的数据文件路径不能为空")
+			}
 			dataPath = args[i+1]
 			i++
-		case len(arg) > 7 && arg[:7] == "--data=":
-			dataPath = arg[7:]
+		case strings.HasPrefix(arg, "--data="):
+			if arg == "--data=" {
+				return "", nil, errors.New("--data= 的数据文件路径不能为空")
+			}
+			dataPath = arg[len("--data="):]
 		default:
 			rest = append(rest, arg)
 		}
 	}
-	return dataPath, rest
+	return dataPath, rest, nil
 }
 
 // flagName 解析 -name / --name 形式的参数名；带 = 的形式值已内联，返回 false。
