@@ -157,6 +157,7 @@ handover/            领域模型、业务规则、JSON 原子持久化与展示
   errors.go          领域错误
   store.go           本地 JSON 存储（快照回滚 + 原子写盘）
   service.go         全部业务规则
+  received_merge.go  item-show 中事项接收历史与交接清单接收记录的合并判定
   render.go          中文命令行展示
 cmd/handover/        命令行入口
 ```
