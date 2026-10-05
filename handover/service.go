@@ -267,6 +267,8 @@ func (svc *Service) AddItem(shiftID, content string, severity Severity, constrai
 }
 
 // UpdateItem 在事项所在班次结束前修改其内容、严重程度、限制条件和后续负责人。
+// 只有本地数据保存成功才算修改完成：写盘失败时内存变更随快照一并回滚，
+// 返回错误与零值事项，不把尚未保存的新值当作修改结果。
 func (svc *Service) UpdateItem(itemID, content string, severity Severity, constraints, followOwner string) (Item, error) {
 	itemID = clean(itemID)
 	content = clean(content)
@@ -318,7 +320,11 @@ func (svc *Service) UpdateItem(itemID, content string, severity Severity, constr
 		updated = *it
 		return nil
 	})
-	return updated, err
+	if err != nil {
+		// 保存失败时内存已回滚，不能把尚未保存的新值当作修改结果返回。
+		return Item{}, err
+	}
+	return updated, nil
 }
 
 func joinOr(xs []string, or string) string {
