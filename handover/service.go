@@ -23,91 +23,6 @@ func (svc *Service) nowAt(fn func() time.Time) { svc.now = fn }
 
 func clean(s string) string { return strings.TrimSpace(s) }
 
-// 事项历史中的接收说明模板。新写入的 received 事件用交接编号、交班、接班班次
-// 与接收方式完整标注；item-show 合并接收记录时依据这些明确记载判定同一次接收，
-// 不能仅凭操作人与时刻合并。模板为固定格式，parseReceivedDetail 据其解析。
-const (
-	receivedDetailPrefix = "交接 "
-	receivedDetailMid    = "（"
-	receivedDetailArrow  = " -> "
-	receivedDetailTail   = "）接班班次接收："
-	// 旧版本写入的说明只明确记载接班班次与接收方式，没有交接编号与交班班次，
-	// 例如“接班班次 S002 接收：确认接收”。其中明确记载的事实仍可用于比对，
-	// 未记载的字段不比较，更不凭空补齐。
-	legacyReceivedPrefix = "接班班次 "
-	legacyReceivedTail   = " 接收："
-)
-
-// receivedDetailText 生成接收事件的标准说明，明确记载交接编号、交班、接班班次
-// 与接收方式；继续跟踪还保留当时的跟踪说明与后续负责人。
-func receivedDetailText(h *Handover, action EntryAction, statusLabel, trackingNote, nextFollowOwner string) string {
-	s := receivedDetailPrefix + h.ID + receivedDetailMid + h.FromShiftID +
-		receivedDetailArrow + h.ToShiftID + receivedDetailTail + statusLabel
-	if action == ActionTrack {
-		s += "；跟踪说明：" + trackingNote + "；后续负责人：" + nextFollowOwner
-	}
-	return s
-}
-
-// receivedAttribution 是从接收说明中明确解析出的归属信息。空字符串表示该
-// 说明没有明确记载这一项，比对时不得据此判断一致或矛盾。
-type receivedAttribution struct {
-	handoverID string
-	fromShift  string
-	toShift    string
-	kind       string // confirm/track，无法确定时为 ""
-}
-
-// receivedKindFromLabel 只识别两种已保存的接收方式中文名；track 的说明后还
-// 带有“；跟踪说明：…”后缀。无法识别返回 ""，不据其他信息猜测。
-func receivedKindFromLabel(label string) string {
-	switch {
-	case label == EntryConfirmed.Label():
-		return "confirm"
-	case label == EntryTracking.Label() || strings.HasPrefix(label, EntryTracking.Label()+"；"):
-		return "track"
-	}
-	return ""
-}
-
-// parseReceivedDetail 只解析本工具写入的固定格式说明（含旧版本格式），提取
-// 其中明确记载的交接编号、交班、接班班次与接收方式。其他文字（外部写入或
-// 残缺的说明）一律视为没有明确记载，返回 ok=false，绝不靠猜测补全。
-func parseReceivedDetail(detail string) (receivedAttribution, bool) {
-	switch {
-	case strings.HasPrefix(detail, receivedDetailPrefix):
-		rest := detail[len(receivedDetailPrefix):]
-		pi := strings.Index(rest, receivedDetailMid)
-		ai := strings.Index(rest, receivedDetailArrow)
-		ti := strings.Index(rest, receivedDetailTail)
-		if pi <= 0 || ai < 0 || ti < 0 || !(pi < ai && ai+len(receivedDetailArrow) < ti) {
-			return receivedAttribution{}, false
-		}
-		hid := rest[:pi]
-		from := rest[pi+len(receivedDetailMid) : ai]
-		to := rest[ai+len(receivedDetailArrow) : ti]
-		kind := receivedKindFromLabel(rest[ti+len(receivedDetailTail):])
-		if hid == "" || from == "" || to == "" || kind == "" {
-			return receivedAttribution{}, false
-		}
-		return receivedAttribution{handoverID: hid, fromShift: from, toShift: to, kind: kind}, true
-	case strings.HasPrefix(detail, legacyReceivedPrefix):
-		rest := detail[len(legacyReceivedPrefix):]
-		ti := strings.Index(rest, legacyReceivedTail)
-		if ti <= 0 {
-			return receivedAttribution{}, false
-		}
-		to := rest[:ti]
-		kind := receivedKindFromLabel(rest[ti+len(legacyReceivedTail):])
-		if to == "" || kind == "" {
-			return receivedAttribution{}, false
-		}
-		// 旧格式只明确记载接班班次与接收方式；交接编号、交班班次未记载。
-		return receivedAttribution{toShift: to, kind: kind}, true
-	}
-	return receivedAttribution{}, false
-}
-
 func requireNonEmpty(field, v string) error {
 	if clean(v) == "" {
 		return fmt.Errorf("%w：%s不能为空", ErrInvalidInput, field)
@@ -847,14 +762,10 @@ func (svc *Service) ItemJourney(itemID string) (ItemJourney, error) {
 		seq++
 	}
 
-	// received 事件与交接清单中的接收处理确属同一次接收时只展示一次（以交接
-	// 事件展示，信息更全：交接编号、交班与接班班次、该次保存的处理结果、操作人、
-	// 时间，继续跟踪还含跟踪说明与当时的后续负责人）。是否同一次接收不能仅凭
-	// 同一操作人与同一实际时刻：接收说明中明确记载的交接编号、交班、接班班次或
-	// 接收方式与本次交接不一致时，两条记录各自保留；说明没有明确记载（旧数据、
-	// 无对应交接清单的接收历史）时同样不合并，缺少足够信息无法确认即原样展示，
-	// 不凭班次负责人、事项当前位置或当前处理结果猜测归属，也不凭空补交接编号。
-	receivedUsed := make([]bool, len(it.Events))
+	// 交接清单一侧的已保存接收（确认接收或继续跟踪）按交接编号顺序收集，
+	// 稍后统一交给接收合并逻辑（见 journey_merge.go）辨认事项自身历史中
+	// 同一次接收的记录。此处只负责汇总清单事实，不在交接循环里混入归属辨认。
+	var receptions []receivedReception
 
 	hs := append([]Handover(nil), d.Handovers...)
 	sort.Slice(hs, func(i, k int) bool { return hs[i].ID < hs[k].ID })
@@ -924,42 +835,23 @@ func (svc *Service) ItemJourney(itemID string) (ItemJourney, error) {
 				FollowOwner: e.FollowOwner,
 			}
 			// 处理时间缺失或为旧数据零值时仍保留该处理事件，
-			// 时间标为未记录，排在有真实时间的事件之后。
+			// 时间标为未记录，排在有真实时间的事件之后；这种记录也不参与
+			// 与事项历史的合并，更不用发起时间代替缺失时间。
 			if validProcessedAt(e.ProcessedAt) {
 				ev.At, ev.TimeKnown = *e.ProcessedAt, true
+				receptions = append(receptions, receivedReception{
+					handoverID: h.ID, fromShift: h.FromShiftID, toShift: h.ToShiftID,
+					kind: kind, operator: e.Operator, at: *e.ProcessedAt,
+				})
 			}
 			add(ev, h.ID)
-			if validProcessedAt(e.ProcessedAt) {
-				for i := range it.Events {
-					iev := &it.Events[i]
-					if iev.Kind != "received" || receivedUsed[i] {
-						continue
-					}
-					if !iev.At.Equal(*e.ProcessedAt) || iev.Operator != e.Operator {
-						continue
-					}
-					// 操作人与实际时刻相同只是前提；还要核对接收说明里明确记载的
-					// 交接编号、交班、接班班次与接收方式。只比较说明中明确记载的
-					// 字段（旧格式没有交接编号与交班班次）：记载与本次一致或未记载
-					// 才合并；明确不一致（交给另一个班次、方式不同、无对应交接
-					// 清单）时跳过这条，继续找真正同一次的记录——两条历史的存放
-					// 先后不能决定哪一条被隐藏。
-					attr, ok := parseReceivedDetail(iev.Detail)
-					if !ok {
-						continue
-					}
-					if (attr.handoverID != "" && attr.handoverID != h.ID) ||
-						(attr.fromShift != "" && attr.fromShift != h.FromShiftID) ||
-						(attr.toShift != "" && attr.toShift != h.ToShiftID) ||
-						(attr.kind != "" && attr.kind != kind) {
-						continue
-					}
-					receivedUsed[i] = true
-					break
-				}
-			}
 		}
 	}
+
+	// 接收合并只依据已记载的事实辨认同一次接收（操作人、实际时刻相同，且说明
+	// 明确记载的交接编号、两班与接收方式不冲突）；辨认逻辑集中在
+	// mergeItemReceivedEvents，与交接经过的汇总相互独立。
+	receivedUsed := mergeItemReceivedEvents(it.Events, receptions)
 
 	// 事项自身历史：建立、修改、关闭原样保留；未被交接接收事件覆盖的
 	// received 事件（旧数据）也保留。

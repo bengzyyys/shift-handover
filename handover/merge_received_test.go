@@ -163,6 +163,39 @@ func TestItemJourneyMergeReceptionDistinguishingFacts(t *testing.T) {
 	}
 }
 
+// TestItemJourneyMergeReceptionMissingProcessedTime：交接清单中的接收缺失或只
+// 有零值处理时间时，该接收不参与合并——不能拿交接发起时间（10:00）等其他时刻
+// 代替，事项历史中同一操作人、同一时刻的 received 记录必须原样保留；清单一侧的
+// 接收仍展示一次，时间标为未记录。
+func TestItemJourneyMergeReceptionMissingProcessedTime(t *testing.T) {
+	// 接收历史时刻与交接发起时间相同（10:00），用来证明不会用发起时间代替
+	// 缺失的处理时间去合并；正常情况下该历史记载与 H001 完全一致本应合并。
+	atInit := `,{"at":"2026-10-02T10:00:00+08:00","kind":"received","operator":"李四","detail":"交接 H001（S001 -> S002）接班班次接收：继续跟踪；跟踪说明：每两小时记录压力；后续负责人：王五"}`
+	for _, tc := range []struct{ name, processedAt string }{
+		{"处理时间缺失", "null"},
+		{"处理时间为零值", `"0001-01-01T00:00:00Z"`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			svc := openLegacyService(t, journeyMergeRaw(atInit, tc.processedAt))
+			j, err := svc.ItemJourney("I001")
+			if err != nil {
+				t.Fatalf("journey: %v", err)
+			}
+			if countKind(j.Events, "track") != 1 {
+				t.Fatalf("清单中的继续跟踪仍应展示一次：%v", journeyKinds(j))
+			}
+			if countKind(j.Events, "received") != 1 {
+				t.Fatalf("缺处理时间的接收不能合并，事项自身接收记录应原样保留：%v", journeyKinds(j))
+			}
+			text := FormatItemJourney(j)
+			if !strings.Contains(text, "未记录 交接 H001（S001 -> S002）继续跟踪 操作人=李四 跟踪说明=每两小时记录压力 后续负责人=王五") ||
+				!strings.Contains(text, "2026-10-02 10:00:00 +08:00 接收 操作人=李四 交接 H001（S001 -> S002）接班班次接收：继续跟踪") {
+				t.Fatalf("清单接收时间应标为未记录、事项历史应原样保留：\n%s", text)
+			}
+		})
+	}
+}
+
 // TestItemJourneyMergeReceptionDoesNotRewrite：单纯查询不改写任何历史、不移动
 // 事项、不改变交接完成情况。
 func TestItemJourneyMergeReceptionDoesNotRewrite(t *testing.T) {
