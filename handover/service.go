@@ -710,29 +710,33 @@ func (svc *Service) ResubmitReturned(handoverID, itemID, operator, supplement st
 	return result, err
 }
 
-// GetShift 按编号查询班次。
+// GetShift 按编号查询班次。返回独立副本：改动结果不影响系统保存的记录。
 func (svc *Service) GetShift(id string) (Shift, error) {
 	sh, _ := findShift(&svc.store.data, clean(id))
 	if sh == nil {
 		return Shift{}, fmt.Errorf("%w：班次 %s", ErrNotFound, id)
 	}
-	return *sh, nil
+	return cloneShift(*sh), nil
 }
 
-// ListShifts 返回全部班次，按编号排序。
+// ListShifts 返回全部班次，按编号排序；每个班次都是独立副本。
 func (svc *Service) ListShifts() []Shift {
-	out := append([]Shift(nil), svc.store.data.Shifts...)
+	out := make([]Shift, len(svc.store.data.Shifts))
+	for i, sh := range svc.store.data.Shifts {
+		out[i] = cloneShift(sh)
+	}
 	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
 	return out
 }
 
-// GetItem 按稳定编号查询事项。
+// GetItem 按稳定编号查询事项。返回独立副本：流经班次、历史事件与关闭时间
+// 都与存储中的记录脱离，改动结果不影响系统保存的记录。
 func (svc *Service) GetItem(id string) (Item, error) {
 	it, _ := findItem(&svc.store.data, clean(id))
 	if it == nil {
 		return Item{}, fmt.Errorf("%w：事项 %s", ErrNotFound, id)
 	}
-	return *it, nil
+	return cloneItem(*it), nil
 }
 
 // ItemJourney 凭事项编号汇总它从建立到当前的处理经过：保留事项自身的
@@ -750,6 +754,12 @@ func (svc *Service) GetItem(id string) (Item, error) {
 // 交接清单一致；任一记载不一致，或说明缺少明确记载（旧数据、没有对应交接
 // 清单的接收历史）时，事项历史原样保留，不凭空补交接编号。只读查询，
 // 不改变事项、交接进度或班次结束时记录。
+// 返回的整份结果是查询当时的独立副本，与班次报告同一约定：事项最新信息
+// （含流经班次、历史事件与关闭时间）、处理经过（含各轮退回原因、补充说明与
+// 补充时间）和各次交接当前结果（含处理时间与历次退回/补充记录）全部深拷贝，
+// 处理经过与交接当前结果中同一次补充的时间也各是一份副本。调用方改动结果
+// 不影响系统保存的数据与其他已取得的结果，系统随后的正常处理（补充后重新
+// 提交、接收、修改、关闭等）也不会改写这份结果；再次查询才反映最新内容。
 func (svc *Service) ItemJourney(itemID string) (ItemJourney, error) {
 	itemID = clean(itemID)
 	d := &svc.store.data
@@ -757,7 +767,7 @@ func (svc *Service) ItemJourney(itemID string) (ItemJourney, error) {
 	if it == nil {
 		return ItemJourney{}, fmt.Errorf("%w：事项 %s", ErrNotFound, itemID)
 	}
-	j := ItemJourney{Item: *it}
+	j := ItemJourney{Item: cloneItem(*it)}
 
 	// 排序键：先按实际发生时刻（未记录时间的排最后），同一时刻下事项自身
 	// 事件在前，其后按交接编号分组，组内保持生成顺序（发起、逐轮退回、
@@ -793,7 +803,7 @@ func (svc *Service) ItemJourney(itemID string) (ItemJourney, error) {
 			HandoverID: h.ID,
 			FromShift:  h.FromShiftID,
 			ToShift:    h.ToShiftID,
-			Entry:      *e,
+			Entry:      cloneEntry(*e),
 		})
 
 		// 发起交接：交接记录本身不记操作人，明确显示未记录，不以班次负责人代替。
@@ -814,7 +824,9 @@ func (svc *Service) ItemJourney(itemID string) (ItemJourney, error) {
 					Kind: "resubmit", Operator: r.SupplementOperator,
 					HandoverID: h.ID, FromShift: h.FromShiftID, ToShift: h.ToShiftID,
 					RoundSeq: r.Seq, Supplement: r.Supplement,
-					SupplementOperator: r.SupplementOperator, SupplementAt: r.SupplementAt,
+					// 补充时间复制一份：处理经过与交接当前结果中同一次补充
+					// 各属各的副本，改动其中一处不影响另一处与存储记录。
+					SupplementOperator: r.SupplementOperator, SupplementAt: cloneTimePtr(r.SupplementAt),
 				}, h.ID)
 			}
 		}
@@ -890,18 +902,22 @@ func (svc *Service) ItemJourney(itemID string) (ItemJourney, error) {
 	return j, nil
 }
 
-// GetHandover 按编号查询交接。
+// GetHandover 按编号查询交接。返回独立副本：清单各项（含处理时间与历次
+// 退回/补充记录）与完成时间都与存储中的记录脱离，改动结果不影响系统保存的记录。
 func (svc *Service) GetHandover(id string) (Handover, error) {
 	h, _ := findHandover(&svc.store.data, clean(id))
 	if h == nil {
 		return Handover{}, fmt.Errorf("%w：交接 %s", ErrNotFound, id)
 	}
-	return *h, nil
+	return cloneHandover(*h), nil
 }
 
-// ListHandovers 返回全部交接记录，按编号排序。
+// ListHandovers 返回全部交接记录，按编号排序；每份交接都是独立副本。
 func (svc *Service) ListHandovers() []Handover {
-	out := append([]Handover(nil), svc.store.data.Handovers...)
+	out := make([]Handover, len(svc.store.data.Handovers))
+	for i, h := range svc.store.data.Handovers {
+		out[i] = cloneHandover(h)
+	}
 	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
 	return out
 }
