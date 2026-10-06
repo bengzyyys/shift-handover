@@ -919,9 +919,90 @@ func (svc *Service) OverlapNotes(shiftID string) []OverlapNote {
 	return out
 }
 
+// cloneTimePtr 复制时间指针，nil 保持 nil。
+func cloneTimePtr(t *time.Time) *time.Time {
+	if t == nil {
+		return nil
+	}
+	v := *t
+	return &v
+}
+
+// cloneItem 深拷贝事项：流经班次、历史事件与关闭时间都与存储中的记录脱离。
+func cloneItem(it Item) Item {
+	out := it
+	out.ShiftIDs = append([]string(nil), it.ShiftIDs...)
+	out.Events = append([]ItemEvent(nil), it.Events...)
+	out.ClosedAt = cloneTimePtr(it.ClosedAt)
+	return out
+}
+
+// cloneCloseItemSnapshot 深拷贝结束时事项快照（含关闭时间指针）。
+func cloneCloseItemSnapshot(s CloseItemSnapshot) CloseItemSnapshot {
+	out := s
+	out.ClosedAt = cloneTimePtr(s.ClosedAt)
+	return out
+}
+
+// cloneCloseRecord 深拷贝班次结束时记录；nil 保持 nil，
+// 空清单仍是非 nil 记录，与缺少结束时记录的旧数据相区别。
+func cloneCloseRecord(rec *ShiftCloseRecord) *ShiftCloseRecord {
+	if rec == nil {
+		return nil
+	}
+	out := &ShiftCloseRecord{}
+	if rec.Items != nil {
+		out.Items = make([]CloseItemSnapshot, len(rec.Items))
+		for i, s := range rec.Items {
+			out.Items[i] = cloneCloseItemSnapshot(s)
+		}
+	}
+	return out
+}
+
+// cloneShift 深拷贝班次：关闭时间与结束时记录都与存储中的记录脱离。
+func cloneShift(sh Shift) Shift {
+	out := sh
+	out.ClosedAt = cloneTimePtr(sh.ClosedAt)
+	out.CloseRecord = cloneCloseRecord(sh.CloseRecord)
+	return out
+}
+
+// cloneEntry 深拷贝交接单项：处理时间与历次退回/补充记录都与存储中的记录脱离。
+func cloneEntry(e HandoverEntry) HandoverEntry {
+	out := e
+	out.ProcessedAt = cloneTimePtr(e.ProcessedAt)
+	if e.Rounds != nil {
+		out.Rounds = make([]ReturnRound, len(e.Rounds))
+		for i, r := range e.Rounds {
+			out.Rounds[i] = r
+			out.Rounds[i].SupplementAt = cloneTimePtr(r.SupplementAt)
+			out.Rounds[i].ResubmittedAt = cloneTimePtr(r.ResubmittedAt)
+		}
+	}
+	return out
+}
+
+// cloneHandover 深拷贝交接记录：完成时间与清单各项都与存储中的记录脱离。
+func cloneHandover(h Handover) Handover {
+	out := h
+	out.CompletedAt = cloneTimePtr(h.CompletedAt)
+	if h.Entries != nil {
+		out.Entries = make([]HandoverEntry, len(h.Entries))
+		for i, e := range h.Entries {
+			out.Entries[i] = cloneEntry(e)
+		}
+	}
+	return out
+}
+
 // ShiftReport 按班次汇总完整事项、关闭情况、接班对象、每项交接当前结果与历次退回/补充说明。
 // 进行中的班次展示当前事项；已结束班次展示结束时冻结的事项记录，
 // 旧数据中缺少结束时记录的班次只展示当前事项并标明历史不完整。
+// 返回的报告是查询当时的独立副本：班次信息、事项清单、结束时记录、最新状态
+// 对照、关联交接与各项结果（含关闭时间、处理时间与历次退回补充记录）全部深拷贝，
+// 调用方改动报告不影响系统保存的数据与其他已取得的报告，系统随后的正常处理
+// 也不会改写这份报告；再次查询才反映最新内容。
 func (svc *Service) ShiftReport(shiftID string) (ShiftReport, error) {
 	shiftID = clean(shiftID)
 	d := &svc.store.data
@@ -930,7 +1011,7 @@ func (svc *Service) ShiftReport(shiftID string) (ShiftReport, error) {
 	if sh == nil {
 		return ShiftReport{}, fmt.Errorf("%w：班次 %s", ErrNotFound, shiftID)
 	}
-	rep.Shift = *sh
+	rep.Shift = cloneShift(*sh)
 
 	for _, n := range d.Notes {
 		if n.ShiftA == sh.ID || n.ShiftB == sh.ID {
@@ -946,11 +1027,14 @@ func (svc *Service) ShiftReport(shiftID string) (ShiftReport, error) {
 	case sh.CloseRecord != nil:
 		// 已结束且有结束时记录：展示冻结的结束时信息，并对照最新状态。
 		rep.ItemsAtClose = true
-		rep.CloseItems = append([]CloseItemSnapshot(nil), sh.CloseRecord.Items...)
+		rep.CloseItems = make([]CloseItemSnapshot, len(sh.CloseRecord.Items))
+		for i, s := range sh.CloseRecord.Items {
+			rep.CloseItems[i] = cloneCloseItemSnapshot(s)
+		}
 		sort.Slice(rep.CloseItems, func(i, j int) bool { return rep.CloseItems[i].ItemID < rep.CloseItems[j].ItemID })
 		for _, s := range rep.CloseItems {
 			if it, _ := findItem(d, s.ItemID); it != nil {
-				rep.LatestItems[s.ItemID] = *it
+				rep.LatestItems[s.ItemID] = cloneItem(*it)
 			}
 		}
 	default:
@@ -959,6 +1043,9 @@ func (svc *Service) ShiftReport(shiftID string) (ShiftReport, error) {
 		rep.Items = currentItemsOfShift(d, sh.ID)
 	}
 	sort.Slice(rep.Items, func(i, j int) bool { return rep.Items[i].ID < rep.Items[j].ID })
+	for i := range rep.Items {
+		rep.Items[i] = cloneItem(rep.Items[i])
+	}
 
 	for i := range d.Handovers {
 		h := &d.Handovers[i]
@@ -967,18 +1054,18 @@ func (svc *Service) ShiftReport(shiftID string) (ShiftReport, error) {
 			continue
 		}
 		if h.FromShiftID == sh.ID {
-			cp := *h
+			cp := cloneHandover(*h)
 			rep.Outgoing = &cp
 		}
 		if h.ToShiftID == sh.ID {
-			rep.Incoming = append(rep.Incoming, *h)
+			rep.Incoming = append(rep.Incoming, cloneHandover(*h))
 		}
 		for j := range h.Entries {
 			rep.Results[h.Entries[j].ItemID] = append(rep.Results[h.Entries[j].ItemID], EntryView{
 				HandoverID: h.ID,
 				FromShift:  h.FromShiftID,
 				ToShift:    h.ToShiftID,
-				Entry:      h.Entries[j],
+				Entry:      cloneEntry(h.Entries[j]),
 			})
 		}
 	}
