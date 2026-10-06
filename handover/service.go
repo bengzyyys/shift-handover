@@ -750,6 +750,15 @@ func (svc *Service) GetItem(id string) (Item, error) {
 // 交接清单一致；任一记载不一致，或说明缺少明确记载（旧数据、没有对应交接
 // 清单的接收历史）时，事项历史原样保留，不凭空补交接编号。只读查询，
 // 不改变事项、交接进度或班次结束时记录。
+//
+// 返回的处理经过是查询当时的独立副本，与按班次查询返回的报告独立性一致：
+// 事项最新信息（含流经班次、历史与关闭时间）、时间线各条经过（含补充时间
+// 指针）与各次交接当前结果（含处理时间、退回轮次、补充与重新提交记录）全部
+// 深拷贝。调用方暂存或调整这份结果（改动历史说明、退回原因、补充内容或已
+// 记录的时间）既不影响系统保存的原记录，也不影响先后取得的其他结果；时间线
+// 与交接当前结果即使展示同一次补充，也各自持有副本。系统随后的正常处理
+// （补充重新提交、接收、修改、关闭）同样不写入已取得的结果，只有再次查询才
+// 反映这些变化，旧结果始终保持取得时的事实。
 func (svc *Service) ItemJourney(itemID string) (ItemJourney, error) {
 	itemID = clean(itemID)
 	d := &svc.store.data
@@ -757,7 +766,7 @@ func (svc *Service) ItemJourney(itemID string) (ItemJourney, error) {
 	if it == nil {
 		return ItemJourney{}, fmt.Errorf("%w：事项 %s", ErrNotFound, itemID)
 	}
-	j := ItemJourney{Item: *it}
+	j := ItemJourney{Item: cloneItem(*it)}
 
 	// 排序键：先按实际发生时刻（未记录时间的排最后），同一时刻下事项自身
 	// 事件在前，其后按交接编号分组，组内保持生成顺序（发起、逐轮退回、
@@ -793,7 +802,7 @@ func (svc *Service) ItemJourney(itemID string) (ItemJourney, error) {
 			HandoverID: h.ID,
 			FromShift:  h.FromShiftID,
 			ToShift:    h.ToShiftID,
-			Entry:      *e,
+			Entry:      cloneEntry(*e),
 		})
 
 		// 发起交接：交接记录本身不记操作人，明确显示未记录，不以班次负责人代替。
@@ -885,7 +894,12 @@ func (svc *Service) ItemJourney(itemID string) (ItemJourney, error) {
 		return a.ord < b.ord
 	})
 	for _, ke := range events {
-		j.Events = append(j.Events, ke.ev)
+		// 时间线中的补充时间指针来自退回轮次记录，复制一份，使调用方改动
+		// 经过中的补充时间不影响存储、交接当前结果或其他已取得的结果
+		//（同一份结果里时间线与交接当前结果展示同一次补充时也各自独立）。
+		ev := ke.ev
+		ev.SupplementAt = cloneTimePtr(ke.ev.SupplementAt)
+		j.Events = append(j.Events, ev)
 	}
 	return j, nil
 }
