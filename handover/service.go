@@ -785,6 +785,9 @@ func (svc *Service) GetItem(id string) (Item, error) {
 // 处理经过与交接当前结果中同一次补充的时间也各是一份副本。调用方改动结果
 // 不影响系统保存的数据与其他已取得的结果，系统随后的正常处理（补充后重新
 // 提交、接收、修改、关闭等）也不会改写这份结果；再次查询才反映最新内容。
+// 这份查询结果的组装本身（当前结果汇总、退回轮次展开、接收记录合并与经过
+// 排列）全部集中在 journey.go 的 buildItemJourney 中，分阶段顺序执行、互不
+// 穿插；本方法只负责只读快照、编号查找与入口深拷贝。
 func (svc *Service) ItemJourney(itemID string) (ItemJourney, error) {
 	itemID = clean(itemID)
 	d := &svc.store.data
@@ -792,139 +795,9 @@ func (svc *Service) ItemJourney(itemID string) (ItemJourney, error) {
 	if it == nil {
 		return ItemJourney{}, fmt.Errorf("%w：事项 %s", ErrNotFound, itemID)
 	}
-	j := ItemJourney{Item: cloneItem(*it)}
-
-	// 排序键：先按实际发生时刻（未记录时间的排最后），同一时刻下事项自身
-	// 事件在前，其后按交接编号分组，组内保持生成顺序（发起、逐轮退回、
-	// 该轮重新提交、后续处理）。
-	type keyedEvent struct {
-		ev    JourneyEvent
-		group string // "" 表示事项自身事件，否则为交接编号
-		ord   int    // 同一（时刻、分组）内的先后
-	}
-	var events []keyedEvent
-	seq := 0
-	add := func(ev JourneyEvent, group string) {
-		events = append(events, keyedEvent{ev: ev, group: group, ord: seq})
-		seq++
-	}
-
-	// 接收记录的合并判定集中在 receivedMerge（见 received_merge.go）：遍历各次
-	// 交接清单时标记与某次接收同属一次的事项 received 事件，该事件随后只以信息
-	// 更全的交接事件展示。未标记的 received 事件（缺交接编号或交班班次的旧
-	// 说明、指向其他交接/班次/方式的说明、自由文字或残缺说明等）在下面原样保留。
-	merge := newReceivedMerge(it.Events)
-
-	hs := append([]Handover(nil), d.Handovers...)
-	sort.Slice(hs, func(i, k int) bool { return hs[i].ID < hs[k].ID })
-	for k := range hs {
-		h := &hs[k]
-		e, _ := findEntry(h, itemID)
-		if e == nil {
-			continue
-		}
-		j.HasHandovers = true
-		j.Results = append(j.Results, EntryView{
-			HandoverID: h.ID,
-			FromShift:  h.FromShiftID,
-			ToShift:    h.ToShiftID,
-			Entry:      cloneEntry(*e),
-		})
-
-		// 发起交接：交接记录本身不记操作人，明确显示未记录，不以班次负责人代替。
-		add(JourneyEvent{
-			At: h.CreatedAt, TimeKnown: !h.CreatedAt.IsZero(),
-			Kind: "handover-init", HandoverID: h.ID, FromShift: h.FromShiftID, ToShift: h.ToShiftID,
-		}, h.ID)
-		for _, r := range e.Rounds {
-			add(JourneyEvent{
-				At: r.ReturnedAt, TimeKnown: !r.ReturnedAt.IsZero(),
-				Kind: "return", Operator: r.ReturnOperator,
-				HandoverID: h.ID, FromShift: h.FromShiftID, ToShift: h.ToShiftID,
-				RoundSeq: r.Seq, Reason: r.Reason,
-			}, h.ID)
-			if r.ResubmittedAt != nil {
-				add(JourneyEvent{
-					At: *r.ResubmittedAt, TimeKnown: !r.ResubmittedAt.IsZero(),
-					Kind: "resubmit", Operator: r.SupplementOperator,
-					HandoverID: h.ID, FromShift: h.FromShiftID, ToShift: h.ToShiftID,
-					RoundSeq: r.Seq, Supplement: r.Supplement,
-					// 补充时间复制一份：处理经过与交接当前结果中同一次补充
-					// 各属各的副本，改动其中一处不影响另一处与存储记录。
-					SupplementOperator: r.SupplementOperator, SupplementAt: cloneTimePtr(r.SupplementAt),
-				}, h.ID)
-			}
-		}
-		if e.Status == EntryReturned && len(e.Rounds) == 0 {
-			// 当前保存的结果是退回，却没有任何退回轮次记录（旧数据缺失）：
-			// 退回确实发生过，处理经过必须呈现这一事实，不能像没发生过退回一样
-			// 只列发起交接；但原因、轮次序号、补充与重新提交经过都没有可靠记录，
-			// 只能使用该项当前保存的处理人与处理时间，并标明退回历史不完整。
-			// 不编造第几次退回或退回原因，也不拿交接发起时间补齐处理时间。
-			ev := JourneyEvent{
-				Kind: "return-incomplete", Operator: e.Operator,
-				HandoverID: h.ID, FromShift: h.FromShiftID, ToShift: h.ToShiftID,
-				HistoryIncomplete: true,
-			}
-			if validProcessedAt(e.ProcessedAt) {
-				ev.At, ev.TimeKnown = *e.ProcessedAt, true
-			}
-			add(ev, h.ID)
-		}
-		if e.Status.Received() {
-			rcpt := receiptFromEntry(h, e)
-			ev := JourneyEvent{
-				Kind: rcpt.kind, Operator: e.Operator,
-				HandoverID: h.ID, FromShift: h.FromShiftID, ToShift: h.ToShiftID,
-				TrackingNote: e.TrackingNote,
-				// 继续跟踪当时指定的后续负责人取自交接记录快照，
-				// 之后修改事项负责人不改变这里的历史值。
-				FollowOwner: e.FollowOwner,
-			}
-			// 处理时间缺失或为旧数据零值时仍保留该处理事件，
-			// 时间标为未记录，排在有真实时间的事件之后；这种凭据 timeKnown
-			// 为 false，consider 不会合并任何事项事件（也不拿发起时间代替）。
-			if rcpt.timeKnown {
-				ev.At, ev.TimeKnown = rcpt.at, true
-			}
-			add(ev, h.ID)
-			// 标记与本次接收同属一次的事项 received 事件；合并依据全部在
-			// sameReceivedEvent 中：操作人与实际时刻相同，且说明完整记载
-			// 交接编号、交班、接班班次与接收方式并逐项一致。缺归属信息的
-			// 旧说明、残缺或自由文字说明一律不合并，原样作为独立接收历史。
-			merge.consider(rcpt)
-		}
-	}
-
-	// 事项自身历史：建立、修改、关闭原样保留；未被合并掉的 received 事件
-	// （旧数据、指向其他归属的说明、自由文字等）也原样保留。
-	for i, iev := range it.Events {
-		if iev.Kind == "received" && merge.isUsed(i) {
-			continue
-		}
-		add(JourneyEvent{
-			At: iev.At, TimeKnown: !iev.At.IsZero(),
-			Kind: iev.Kind, Operator: iev.Operator, Detail: iev.Detail,
-		}, "")
-	}
-
-	sort.SliceStable(events, func(i, k int) bool {
-		a, b := events[i], events[k]
-		if a.ev.TimeKnown != b.ev.TimeKnown {
-			return a.ev.TimeKnown
-		}
-		if a.ev.TimeKnown && !a.ev.At.Equal(b.ev.At) {
-			return a.ev.At.Before(b.ev.At)
-		}
-		if a.group != b.group {
-			return a.group < b.group
-		}
-		return a.ord < b.ord
-	})
-	for _, ke := range events {
-		j.Events = append(j.Events, ke.ev)
-	}
-	return j, nil
+	// 传入当前保存的事项与全部交接，由 buildItemJourney 统一深拷贝与组装：
+	// 返回结果与存储脱离，是查询当时的独立内容（详见 journey.go）。
+	return buildItemJourney(*it, d.Handovers), nil
 }
 
 // GetHandover 按编号查询交接。返回独立副本：清单各项（含处理时间与历次
