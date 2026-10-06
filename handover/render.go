@@ -126,6 +126,64 @@ func currentProcessing(e HandoverEntry) (operator, processedAt string) {
 	return whoIfRecorded(e.Operator), fmtProcessedAtIfRecorded(e.ProcessedAt)
 }
 
+// returnRoundView 是一轮退回历史在展示层的统一解读。交接查询
+// （handover-show，及 shift-show 报告内嵌的交接清单）与班次报告末尾
+// “各项交接当前结果”两处共用同一份判断，只保留各自的措辞、缩进与
+// 字段次序——统一维护的是共同规则，不是把两处改成同一种文本。
+type returnRoundView struct {
+	Seq            int
+	ReturnedAt     string // 退回时间：真实值用带时区格式；缺失或零值显示未记录
+	ReturnOperator string // 退回人：有值保留原姓名，缺失显示未记录
+	Reason         string // 该轮保存的退回原因，原样展示
+
+	HasSupplement      bool   // 该轮是否保存了非空补充说明；没有就不产生补充段落
+	Supplement         string // 该轮保存的补充说明
+	SupplementOperator string // 补充人：缺失显示未记录
+	SupplementAt       string // 补充时间：缺失（nil）或零值显示未记录
+
+	Resubmitted   bool   // 该轮是否保存了重新提交时间（旧数据零值也算已重新提交）
+	ResubmittedAt string // 重新提交时间：零值显示未记录；未保存时不展示该行
+}
+
+// viewReturnRound 按共同规则解读一轮已保存的退回历史。它只做展示判断，
+// 不补齐、不推测：
+//   - 姓名有值保留原姓名、缺失显示未记录；时间缺失或为旧数据零值
+//     （0001-01-01T00:00:00Z）显示未记录，真实时间沿用带时区格式，
+//     姓名与时间各自独立判断，缺一个不隐藏另一个；
+//   - 不用班次负责人、交接发起时间、当前处理人或其他轮次的资料补齐
+//     本轮记录；
+//   - 该轮没有非空补充说明时不产生补充段落；没有重新提交时间时不显示
+//     已重新提交；保存了零值重新提交时间仍按已重新提交展示、时间显示
+//     未记录，不悄悄改成尚未提交。
+func viewReturnRound(r ReturnRound) returnRoundView {
+	v := returnRoundView{
+		Seq:            r.Seq,
+		ReturnedAt:     fmtTimeIfRecorded(r.ReturnedAt),
+		ReturnOperator: whoIfRecorded(r.ReturnOperator),
+		Reason:         r.Reason,
+		Resubmitted:    r.ResubmittedAt != nil,
+		ResubmittedAt:  fmtTimePtrIfRecorded(r.ResubmittedAt),
+	}
+	if r.Supplement != "" {
+		v.HasSupplement = true
+		v.Supplement = r.Supplement
+		v.SupplementOperator = whoIfRecorded(r.SupplementOperator)
+		v.SupplementAt = fmtTimePtrIfRecorded(r.SupplementAt)
+	}
+	return v
+}
+
+// viewReturnRounds 按保存次序解读全部退回轮次，不增删、不重排、不补造：
+// 连续发生多轮退回时每轮各用各的退回原因与补充说明，前一轮的原因和
+// 补充不会被后一轮替换；没有退回轮次时返回空切片，调用方不补造轮次。
+func viewReturnRounds(rounds []ReturnRound) []returnRoundView {
+	vs := make([]returnRoundView, len(rounds))
+	for i, r := range rounds {
+		vs[i] = viewReturnRound(r)
+	}
+	return vs
+}
+
 // entryCurrentResultLabel 是交接当前结果在事项处理经过查询中的展示名。
 // 缺失或空结果显示“处理结果未记录”，无法识别的结果显示“处理结果无法识别”
 // 并带出保存的原值，与交接清单、班次报告表达同一事实，不推测成已接收。
@@ -271,17 +329,17 @@ func FormatEntry(e HandoverEntry) string {
 		fmt.Fprintf(&b, "  跟踪说明：%s\n", dashIfEmpty(e.TrackingNote))
 		fmt.Fprintf(&b, "  跟踪后续负责人：%s\n", dashIfEmpty(e.FollowOwner))
 	}
-	for _, r := range e.Rounds {
+	// 逐轮退回、补充与重新提交沿用共用的退回历史解读规则
+	// （见 viewReturnRound），保留本处原有措辞、缩进与字段次序。
+	for _, r := range viewReturnRounds(e.Rounds) {
 		fmt.Fprintf(&b, "  第%d次退回：%s 操作人=%s 原因=%s\n",
-			r.Seq, fmtTimeIfRecorded(r.ReturnedAt),
-			whoIfRecorded(r.ReturnOperator), r.Reason)
-		if r.Supplement != "" {
+			r.Seq, r.ReturnedAt, r.ReturnOperator, r.Reason)
+		if r.HasSupplement {
 			fmt.Fprintf(&b, "    补充说明：%s 补充人=%s 补充时间=%s\n",
-				r.Supplement, whoIfRecorded(r.SupplementOperator),
-				fmtTimePtrIfRecorded(r.SupplementAt))
+				r.Supplement, r.SupplementOperator, r.SupplementAt)
 		}
-		if r.ResubmittedAt != nil {
-			fmt.Fprintf(&b, "    已重新提交：%s\n", fmtTimePtrIfRecorded(r.ResubmittedAt))
+		if r.Resubmitted {
+			fmt.Fprintf(&b, "    已重新提交：%s\n", r.ResubmittedAt)
 		}
 	}
 	return b.String()
@@ -382,17 +440,17 @@ func FormatReport(rep ShiftReport) string {
 			fmt.Fprintf(&b, "  事项 %s 交接 %s（%s -> %s）当前结果：%s；处理人=%s；处理时间=%s\n",
 				id, v.HandoverID, v.FromShift, v.ToShift,
 				v.Entry.Status.Label(), operator, processedAt)
-			for _, r := range v.Entry.Rounds {
+			// 退回历史与内嵌交接清单共用同一解读规则（见
+			// viewReturnRound），这里保留结果区原有的措辞、缩进与字段次序。
+			for _, r := range viewReturnRounds(v.Entry.Rounds) {
 				fmt.Fprintf(&b, "    第%d次退回：操作人=%s 时间=%s 原因=%s\n",
-					r.Seq, whoIfRecorded(r.ReturnOperator),
-					fmtTimeIfRecorded(r.ReturnedAt), r.Reason)
-				if r.Supplement != "" {
+					r.Seq, r.ReturnOperator, r.ReturnedAt, r.Reason)
+				if r.HasSupplement {
 					fmt.Fprintf(&b, "      补充：%s（补充人=%s，补充时间=%s）\n",
-						r.Supplement, whoIfRecorded(r.SupplementOperator),
-						fmtTimePtrIfRecorded(r.SupplementAt))
+						r.Supplement, r.SupplementOperator, r.SupplementAt)
 				}
-				if r.ResubmittedAt != nil {
-					fmt.Fprintf(&b, "      已重新提交：%s\n", fmtTimePtrIfRecorded(r.ResubmittedAt))
+				if r.Resubmitted {
+					fmt.Fprintf(&b, "      已重新提交：%s\n", r.ResubmittedAt)
 				}
 			}
 		}
