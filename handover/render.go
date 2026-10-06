@@ -251,6 +251,85 @@ func FormatOverlapNote(n OverlapNote) string {
 		n.ID, n.Position, n.ShiftA, n.ShiftB, fmtTime(n.CreatedAt), n.Note)
 }
 
+// returnRoundView 是一轮退回历史在展示层的共同解释。交接清单
+// （handover-show 与 shift-show 内嵌清单的 FormatEntry）和班次报告末尾
+// “各项交接当前结果”（FormatReport）处理的是同一份退回历史，是否有补充、
+// 是否已重新提交、缺失的人名和时间怎样显示都在这里统一判定，两处只保留
+// 各自的措辞、缩进与字段次序。
+type returnRoundView struct {
+	seq            int
+	returnedAt     string
+	returnOperator string
+	reason         string
+	// hasSupplement 以已保存的补充说明非空为准：没有补充的轮次不产生补充
+	// 段落，不因补充人或补充时间残留而凭空展示。
+	hasSupplement      bool
+	supplement         string
+	supplementOperator string
+	supplementAt       string
+	// hasResubmit 只认是否保存了重新提交时间：保存了零值时间
+	// （0001-01-01T00:00:00Z）仍算已重新提交，时间展示为未记录；
+	// 没有保存时不显示已重新提交。
+	hasResubmit   bool
+	resubmittedAt string
+}
+
+// viewReturnRound 按共同规则解释一轮退回历史，只读该轮已保存的数据：
+//   - 逐轮按保存次序展示，每轮带出保存的轮次、原因、退回人和退回时间，
+//     连续多轮退回时前一轮的原因、退回人与补充不被后一轮替换；
+//   - 退回人、补充人姓名有值就保留，缺失分别显示未记录；退回时间缺失或为
+//     零值、补充时间缺失同样显示未记录，真实时间沿用带时区的现有格式；
+//   - 不以班次负责人、交接发起时间或另一轮的资料补齐缺失项。
+func viewReturnRound(r ReturnRound) returnRoundView {
+	v := returnRoundView{
+		seq:            r.Seq,
+		returnedAt:     fmtTimeIfRecorded(r.ReturnedAt),
+		returnOperator: whoIfRecorded(r.ReturnOperator),
+		reason:         r.Reason,
+		hasResubmit:    r.ResubmittedAt != nil,
+		resubmittedAt:  fmtTimePtrIfRecorded(r.ResubmittedAt),
+	}
+	if r.Supplement != "" {
+		v.hasSupplement = true
+		v.supplement = r.Supplement
+		v.supplementOperator = whoIfRecorded(r.SupplementOperator)
+		v.supplementAt = fmtTimePtrIfRecorded(r.SupplementAt)
+	}
+	return v
+}
+
+// writeEntryReturnRound 按内嵌交接清单的措辞与字段次序输出一轮退回：
+// 退回行先时间后操作人，补充与重新提交在退回行下缩进两级。
+// pfx 是退回行的缩进，补充/重新提交行再多缩进两级。
+func writeEntryReturnRound(b *strings.Builder, r ReturnRound, pfx string) {
+	v := viewReturnRound(r)
+	fmt.Fprintf(b, "%s第%d次退回：%s 操作人=%s 原因=%s\n",
+		pfx, v.seq, v.returnedAt, v.returnOperator, v.reason)
+	if v.hasSupplement {
+		fmt.Fprintf(b, "%s  补充说明：%s 补充人=%s 补充时间=%s\n",
+			pfx, v.supplement, v.supplementOperator, v.supplementAt)
+	}
+	if v.hasResubmit {
+		fmt.Fprintf(b, "%s  已重新提交：%s\n", pfx, v.resubmittedAt)
+	}
+}
+
+// writeResultReturnRound 按班次报告末尾“各项交接当前结果”的措辞与字段
+// 次序输出一轮退回：退回行先操作人后时间，补充用括号附补充人与时间。
+// pfx 是退回行的缩进，补充/重新提交行再多缩进两级。
+func writeResultReturnRound(b *strings.Builder, r ReturnRound, pfx string) {
+	v := viewReturnRound(r)
+	fmt.Fprintf(b, "%s第%d次退回：操作人=%s 时间=%s 原因=%s\n",
+		pfx, v.seq, v.returnOperator, v.returnedAt, v.reason)
+	if v.hasSupplement {
+		fmt.Fprintf(b, "%s  补充：%s（补充人=%s，补充时间=%s）\n",
+			pfx, v.supplement, v.supplementOperator, v.supplementAt)
+	}
+	if v.hasResubmit {
+		fmt.Fprintf(b, "%s  已重新提交：%s\n", pfx, v.resubmittedAt)
+	}
+}
+
 // FormatEntry 格式化交接单项当前结果与历次退回、补充说明。
 func FormatEntry(e HandoverEntry) string {
 	var b strings.Builder
@@ -271,18 +350,10 @@ func FormatEntry(e HandoverEntry) string {
 		fmt.Fprintf(&b, "  跟踪说明：%s\n", dashIfEmpty(e.TrackingNote))
 		fmt.Fprintf(&b, "  跟踪后续负责人：%s\n", dashIfEmpty(e.FollowOwner))
 	}
+	// 逐轮退回、补充与重新提交的共同展示规则见 viewReturnRound；
+	// 这里只负责内嵌交接清单自己的措辞与缩进。
 	for _, r := range e.Rounds {
-		fmt.Fprintf(&b, "  第%d次退回：%s 操作人=%s 原因=%s\n",
-			r.Seq, fmtTimeIfRecorded(r.ReturnedAt),
-			whoIfRecorded(r.ReturnOperator), r.Reason)
-		if r.Supplement != "" {
-			fmt.Fprintf(&b, "    补充说明：%s 补充人=%s 补充时间=%s\n",
-				r.Supplement, whoIfRecorded(r.SupplementOperator),
-				fmtTimePtrIfRecorded(r.SupplementAt))
-		}
-		if r.ResubmittedAt != nil {
-			fmt.Fprintf(&b, "    已重新提交：%s\n", fmtTimePtrIfRecorded(r.ResubmittedAt))
-		}
+		writeEntryReturnRound(&b, r, "  ")
 	}
 	return b.String()
 }
@@ -382,18 +453,10 @@ func FormatReport(rep ShiftReport) string {
 			fmt.Fprintf(&b, "  事项 %s 交接 %s（%s -> %s）当前结果：%s；处理人=%s；处理时间=%s\n",
 				id, v.HandoverID, v.FromShift, v.ToShift,
 				v.Entry.Status.Label(), operator, processedAt)
+			// 逐轮退回、补充与重新提交的共同展示规则见
+			// viewReturnRound；这里只负责报告末尾说明自己的措辞与缩进。
 			for _, r := range v.Entry.Rounds {
-				fmt.Fprintf(&b, "    第%d次退回：操作人=%s 时间=%s 原因=%s\n",
-					r.Seq, whoIfRecorded(r.ReturnOperator),
-					fmtTimeIfRecorded(r.ReturnedAt), r.Reason)
-				if r.Supplement != "" {
-					fmt.Fprintf(&b, "      补充：%s（补充人=%s，补充时间=%s）\n",
-						r.Supplement, whoIfRecorded(r.SupplementOperator),
-						fmtTimePtrIfRecorded(r.SupplementAt))
-				}
-				if r.ResubmittedAt != nil {
-					fmt.Fprintf(&b, "      已重新提交：%s\n", fmtTimePtrIfRecorded(r.ResubmittedAt))
-				}
+				writeResultReturnRound(&b, r, "    ")
 			}
 		}
 	}
