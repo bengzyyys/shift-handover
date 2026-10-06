@@ -175,7 +175,12 @@ func (svc *Service) CreateShift(position, owner string, start, end time.Time, ov
 		}
 		return nil
 	})
-	return created, err
+	if err != nil {
+		return Shift{}, err
+	}
+	// 返回独立副本：调用方保留的建立结果（关闭时间等指针字段）不与系统
+	// 保存的班次共享内存。
+	return cloneShift(created), nil
 }
 
 // AddOverlapNote 为同岗位两个重叠班次保存重叠说明。
@@ -263,7 +268,12 @@ func (svc *Service) AddItem(shiftID, content string, severity Severity, constrai
 		d.Items = append(d.Items, created)
 		return nil
 	})
-	return created, err
+	if err != nil {
+		return Item{}, err
+	}
+	// 返回独立副本：调用方保留的新增结果与系统保存的事项脱离，
+	// 改动结果不影响存储，也不会在后续正常保存时被带进存储。
+	return cloneItem(created), nil
 }
 
 // UpdateItem 在事项所在班次结束前修改其内容、严重程度、限制条件和后续负责人。
@@ -324,7 +334,8 @@ func (svc *Service) UpdateItem(itemID, content string, severity Severity, constr
 		// 保存失败时内存已回滚，不能把尚未保存的新值当作修改结果返回。
 		return Item{}, err
 	}
-	return updated, nil
+	// 返回独立副本：调用方保留的修改结果不与系统保存的事项共享内存。
+	return cloneItem(updated), nil
 }
 
 func joinOr(xs []string, or string) string {
@@ -370,7 +381,9 @@ func (svc *Service) CloseItem(itemID, operator string) (Item, error) {
 		// 保存失败时内存已回滚，不能把尚未保存的关闭状态当作关闭结果返回。
 		return Item{}, err
 	}
-	return closed, nil
+	// 返回独立副本：调用方保留的关闭结果（含关闭时间）与系统保存的事项脱离；
+	// 班次结束后再改写这份结果中的关闭时刻，结束时记录里保留的仍是当时的值。
+	return cloneItem(closed), nil
 }
 
 // CloseShift 结束班次。任一接班交接存在未确认接收的事项（待处理、退回、
@@ -379,6 +392,10 @@ func (svc *Service) CloseItem(itemID, operator string) (Item, error) {
 // 结束成功时把在班事项（本班新增与已接收，含结束前已关闭者）冻结为结束时记录；
 // 校验或保存失败时不留下任何记录，班次保持进行中，也不改变交接结果、
 // 事项归属与已保存的处理经过。
+// 返回的班次结果是成功结束时的独立副本（关闭时间与结束时记录均深拷贝）：
+// 调用方为本地展示改动结果（实际结束时刻、事项内容、清单项、关闭时间等）
+// 只影响手中的结果，不改变系统保存的结束时事实，也不随之后的正常保存被带进
+// 存储；先取得的另一份结果同样互不影响。
 func (svc *Service) CloseShift(shiftID string) (Shift, error) {
 	shiftID = clean(shiftID)
 	var result Shift
@@ -402,7 +419,9 @@ func (svc *Service) CloseShift(shiftID string) (Shift, error) {
 		sh.ClosedAt = &now
 
 		// 冻结结束时在班的全部事项。退回或未确认的交接事项当前班次仍在交班
-		// 班次，不会被快照；结束前已关闭的事项保留关闭人与关闭时间。
+		// 班次，不会被快照；结束前已关闭的事项保留关闭人与关闭时间。每项指针
+		// （关闭时间）都复制一份：结束时记录保留这次成功结束时的事实，既不与
+		// 事项当前记录共享内存，也不与交给调用方的结果共享内存。
 		record := &ShiftCloseRecord{Items: []CloseItemSnapshot{}}
 		for i := range d.Items {
 			it := &d.Items[i]
@@ -416,14 +435,15 @@ func (svc *Service) CloseShift(shiftID string) (Shift, error) {
 				Constraints:   it.Constraints,
 				FollowOwner:   it.FollowOwner,
 				Closed:        it.Closed,
-				ClosedAt:      it.ClosedAt,
+				ClosedAt:      cloneTimePtr(it.ClosedAt),
 				CloseOperator: it.CloseOperator,
 			})
 		}
 		sort.Slice(record.Items, func(i, j int) bool { return record.Items[i].ItemID < record.Items[j].ItemID })
 		sh.CloseRecord = record
 
-		result = *sh
+		// 返回独立副本：调用方改写自己保留的结果不能影响系统保存的结束时记录。
+		result = cloneShift(*sh)
 		return nil
 	})
 	return result, err
@@ -462,7 +482,9 @@ func (svc *Service) CreateHandover(fromShiftID, toShiftID string) (Handover, err
 		for i := range d.Handovers {
 			if d.Handovers[i].FromShiftID == from.ID {
 				existing := &d.Handovers[i]
-				result = *existing
+				// 即使以“已存在”错误返回，交出的也是独立副本，调用方改动
+				// 不影响系统保存的原交接记录。
+				result = cloneHandover(*existing)
 				if existing.ToShiftID != to.ID {
 					return fmt.Errorf("%w：交班班次 %s 已指定接班班次 %s，不能改换为 %s",
 						ErrHandoverTarget, from.ID, existing.ToShiftID, to.ID)
@@ -526,7 +548,7 @@ func (svc *Service) CreateHandover(fromShiftID, toShiftID string) (Handover, err
 			h.CompletedAt = &now
 		}
 		d.Handovers = append(d.Handovers, h)
-		result = h
+		result = cloneHandover(h)
 		return nil
 	})
 	return result, err
@@ -636,7 +658,9 @@ func (svc *Service) ProcessEntry(handoverID, itemID string, action EntryAction, 
 			// 项无法再处理，完成时间不会被改写。
 			h.CompletedAt = &now
 		}
-		result = *h
+		// 返回独立副本：调用方保留的处理结果（含逐项处理时间、退回/补充记录
+		// 与完成时间）不与系统保存的交接共享内存。
+		result = cloneHandover(*h)
 		return nil
 	})
 	return result, err
@@ -704,7 +728,8 @@ func (svc *Service) ResubmitReturned(handoverID, itemID, operator, supplement st
 		e.Status = EntryPending
 		e.Operator = ""
 		e.ProcessedAt = nil
-		result = *h
+		// 返回独立副本：调用方保留的重新提交结果不与系统保存的交接共享内存。
+		result = cloneHandover(*h)
 		return nil
 	})
 	return result, err
