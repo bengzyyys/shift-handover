@@ -465,11 +465,19 @@ func (svc *Service) CloseShift(shiftID string) (Shift, error) {
 // ErrHandoverTarget 并指出原接班班次，无论新对象是否结束都不产生第二条交接。
 // 不存在的班次编号与交给自身始终按各自错误拒绝；同岗位及接班班次尚未结束等
 // 要求仅对首次发起生效。
+// 只有本地数据保存成功才算发起完成：首次发起的输入与班次状态均合法、实际进入
+// 保存阶段后写盘失败时，内存变更随快照一并回滚，返回原保存错误与零值交接结果
+// （编号、岗位、两班编号为空，发起时间为零值，完成时间为空，清单没有事项），
+// 不把尚未保存的编号、发起时间、清单或空清单的完成时间当作发起结果；失败尝试
+// 不占用交接编号，也不留下已指定接班对象的关系。
 func (svc *Service) CreateHandover(fromShiftID, toShiftID string) (Handover, error) {
 	fromShiftID = clean(fromShiftID)
 	toShiftID = clean(toShiftID)
 
 	var result Handover
+	// saved 标记业务变更是否已完整执行、只待落盘：此后出现的错误只能是保存
+	// 阶段失败，而不是业务拒绝。
+	saved := false
 	err := svc.store.mutate(func(d *Data) error {
 		from, _ := findShift(d, fromShiftID)
 		to, _ := findShift(d, toShiftID)
@@ -558,9 +566,20 @@ func (svc *Service) CreateHandover(fromShiftID, toShiftID string) (Handover, err
 		}
 		d.Handovers = append(d.Handovers, h)
 		result = cloneHandover(h)
+		saved = true
 		return nil
 	})
-	return result, err
+	if err != nil {
+		if saved {
+			// 业务校验全部通过、实际进入保存阶段后失败：内存已随快照回滚，
+			// 不能把尚未保存的新交接（编号、发起时间、清单与空清单的完成时间）
+			// 当作发起结果交给调用方。
+			return Handover{}, err
+		}
+		// 业务拒绝：重复发起与改换对象仍按承诺返回保存的原记录。
+		return result, err
+	}
+	return result, nil
 }
 
 // ProcessEntry 由接班人逐项处理交接事项，须填写操作人。
