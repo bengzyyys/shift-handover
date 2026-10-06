@@ -919,9 +919,122 @@ func (svc *Service) OverlapNotes(shiftID string) []OverlapNote {
 	return out
 }
 
+// 以下深拷贝助手保证按班次查询返回的报告是查询当时的独立快照：报告与
+// Store 中的班次、事项、交接记录不共享任何可写内存（切片、时间指针、
+// 结束时记录）。调用方改动自己拿到的报告不会影响系统里的记录，也不会
+// 影响另一份已取得的报告；系统后续的正常业务处理同样不会改写已经返回
+// 的报告。nil 与空切片的区别原样保留（如结束时没有事项的空记录与根本
+// 没有结束时记录仍是两种情形）。
+
+func copyTimePtr(t *time.Time) *time.Time {
+	if t == nil {
+		return nil
+	}
+	v := *t
+	return &v
+}
+
+func copyStrings(xs []string) []string {
+	if xs == nil {
+		return nil
+	}
+	return append([]string(nil), xs...)
+}
+
+func copyItemEvents(evs []ItemEvent) []ItemEvent {
+	if evs == nil {
+		return nil
+	}
+	return append([]ItemEvent(nil), evs...)
+}
+
+func copyItem(it Item) Item {
+	out := it
+	out.ShiftIDs = copyStrings(it.ShiftIDs)
+	out.ClosedAt = copyTimePtr(it.ClosedAt)
+	out.Events = copyItemEvents(it.Events)
+	return out
+}
+
+func copyItems(items []Item) []Item {
+	if items == nil {
+		return nil
+	}
+	out := make([]Item, len(items))
+	for i := range items {
+		out[i] = copyItem(items[i])
+	}
+	return out
+}
+
+func copyCloseItemSnapshot(s CloseItemSnapshot) CloseItemSnapshot {
+	out := s
+	out.ClosedAt = copyTimePtr(s.ClosedAt)
+	return out
+}
+
+func copyCloseItemSnapshots(snaps []CloseItemSnapshot) []CloseItemSnapshot {
+	if snaps == nil {
+		return nil
+	}
+	out := make([]CloseItemSnapshot, len(snaps))
+	for i := range snaps {
+		out[i] = copyCloseItemSnapshot(snaps[i])
+	}
+	return out
+}
+
+func copyCloseRecord(rec *ShiftCloseRecord) *ShiftCloseRecord {
+	if rec == nil {
+		return nil
+	}
+	return &ShiftCloseRecord{Items: copyCloseItemSnapshots(rec.Items)}
+}
+
+func copyShift(sh Shift) Shift {
+	out := sh
+	out.ClosedAt = copyTimePtr(sh.ClosedAt)
+	out.CloseRecord = copyCloseRecord(sh.CloseRecord)
+	return out
+}
+
+func copyReturnRound(r ReturnRound) ReturnRound {
+	out := r
+	out.SupplementAt = copyTimePtr(r.SupplementAt)
+	out.ResubmittedAt = copyTimePtr(r.ResubmittedAt)
+	return out
+}
+
+func copyHandoverEntry(e HandoverEntry) HandoverEntry {
+	out := e
+	out.ProcessedAt = copyTimePtr(e.ProcessedAt)
+	if e.Rounds != nil {
+		out.Rounds = make([]ReturnRound, len(e.Rounds))
+		for i := range e.Rounds {
+			out.Rounds[i] = copyReturnRound(e.Rounds[i])
+		}
+	}
+	return out
+}
+
+func copyHandover(h Handover) Handover {
+	out := h
+	out.CompletedAt = copyTimePtr(h.CompletedAt)
+	if h.Entries != nil {
+		out.Entries = make([]HandoverEntry, len(h.Entries))
+		for i := range h.Entries {
+			out.Entries[i] = copyHandoverEntry(h.Entries[i])
+		}
+	}
+	return out
+}
+
 // ShiftReport 按班次汇总完整事项、关闭情况、接班对象、每项交接当前结果与历次退回/补充说明。
 // 进行中的班次展示当前事项；已结束班次展示结束时冻结的事项记录，
 // 旧数据中缺少结束时记录的班次只展示当前事项并标明历史不完整。
+// 返回的报告是查询当时的独立深拷贝快照：调用方对报告的任何改动都不
+// 影响系统保存的班次、事项与交接记录，也不影响其他已取得的报告；
+// 之后的业务处理同样不会改写这份报告，重新查询才能看到最新内容。
 func (svc *Service) ShiftReport(shiftID string) (ShiftReport, error) {
 	shiftID = clean(shiftID)
 	d := &svc.store.data
@@ -930,7 +1043,7 @@ func (svc *Service) ShiftReport(shiftID string) (ShiftReport, error) {
 	if sh == nil {
 		return ShiftReport{}, fmt.Errorf("%w：班次 %s", ErrNotFound, shiftID)
 	}
-	rep.Shift = *sh
+	rep.Shift = copyShift(*sh)
 
 	for _, n := range d.Notes {
 		if n.ShiftA == sh.ID || n.ShiftB == sh.ID {
@@ -942,21 +1055,21 @@ func (svc *Service) ShiftReport(shiftID string) (ShiftReport, error) {
 	switch {
 	case !sh.Closed:
 		// 进行中的班次：事项可继续修改、关闭，展示当前信息。
-		rep.Items = currentItemsOfShift(d, sh.ID)
+		rep.Items = copyItems(currentItemsOfShift(d, sh.ID))
 	case sh.CloseRecord != nil:
 		// 已结束且有结束时记录：展示冻结的结束时信息，并对照最新状态。
 		rep.ItemsAtClose = true
-		rep.CloseItems = append([]CloseItemSnapshot(nil), sh.CloseRecord.Items...)
+		rep.CloseItems = copyCloseItemSnapshots(sh.CloseRecord.Items)
 		sort.Slice(rep.CloseItems, func(i, j int) bool { return rep.CloseItems[i].ItemID < rep.CloseItems[j].ItemID })
 		for _, s := range rep.CloseItems {
 			if it, _ := findItem(d, s.ItemID); it != nil {
-				rep.LatestItems[s.ItemID] = *it
+				rep.LatestItems[s.ItemID] = copyItem(*it)
 			}
 		}
 	default:
 		// 旧数据：结束时未留下记录，只能展示当前信息，不能宣称是结束时事实。
 		rep.HistoryIncomplete = true
-		rep.Items = currentItemsOfShift(d, sh.ID)
+		rep.Items = copyItems(currentItemsOfShift(d, sh.ID))
 	}
 	sort.Slice(rep.Items, func(i, j int) bool { return rep.Items[i].ID < rep.Items[j].ID })
 
@@ -967,18 +1080,18 @@ func (svc *Service) ShiftReport(shiftID string) (ShiftReport, error) {
 			continue
 		}
 		if h.FromShiftID == sh.ID {
-			cp := *h
+			cp := copyHandover(*h)
 			rep.Outgoing = &cp
 		}
 		if h.ToShiftID == sh.ID {
-			rep.Incoming = append(rep.Incoming, *h)
+			rep.Incoming = append(rep.Incoming, copyHandover(*h))
 		}
 		for j := range h.Entries {
 			rep.Results[h.Entries[j].ItemID] = append(rep.Results[h.Entries[j].ItemID], EntryView{
 				HandoverID: h.ID,
 				FromShift:  h.FromShiftID,
 				ToShift:    h.ToShiftID,
-				Entry:      h.Entries[j],
+				Entry:      copyHandoverEntry(h.Entries[j]),
 			})
 		}
 	}
