@@ -335,6 +335,9 @@ func joinOr(xs []string, or string) string {
 }
 
 // CloseItem 在事项所在班次结束前关闭该事项，须填写操作人。
+// 只有本地数据保存成功才算关闭完成：写盘失败时内存变更随快照一并回滚，
+// 返回错误与零值事项，不把尚未保存的关闭当作结果，避免调用方据此显示
+// “已关闭事项”的成功提示或把这次操作算作已完成的关闭。
 func (svc *Service) CloseItem(itemID, operator string) (Item, error) {
 	itemID = clean(itemID)
 	operator = clean(operator)
@@ -364,7 +367,11 @@ func (svc *Service) CloseItem(itemID, operator string) (Item, error) {
 		closed = *it
 		return nil
 	})
-	return closed, err
+	if err != nil {
+		// 保存失败时内存已回滚，不能把尚未保存的关闭当作关闭结果返回。
+		return Item{}, err
+	}
+	return closed, nil
 }
 
 // CloseShift 结束班次。任一接班交接存在未确认接收的事项（待处理、退回、
