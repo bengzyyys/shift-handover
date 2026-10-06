@@ -269,6 +269,7 @@ func (svc *Service) AddItem(shiftID, content string, severity Severity, constrai
 // UpdateItem 在事项所在班次结束前修改其内容、严重程度、限制条件和后续负责人。
 // 只有本地数据保存成功才算修改完成：写盘失败时内存变更随快照一并回滚，
 // 返回错误与零值事项，不把尚未保存的新值当作修改结果。
+// 成功返回的事项是独立副本，调用方改动这份结果不影响系统保存的记录。
 func (svc *Service) UpdateItem(itemID, content string, severity Severity, constraints, followOwner string) (Item, error) {
 	itemID = clean(itemID)
 	content = clean(content)
@@ -317,7 +318,7 @@ func (svc *Service) UpdateItem(itemID, content string, severity Severity, constr
 			Kind:   "updated",
 			Detail: "修改字段：" + joinOr(changes, "无变更"),
 		})
-		updated = *it
+		updated = cloneItem(*it)
 		return nil
 	})
 	if err != nil {
@@ -337,6 +338,8 @@ func joinOr(xs []string, or string) string {
 // CloseItem 在事项所在班次结束前关闭该事项，须填写操作人。
 // 只有本地数据保存成功才算关闭完成：写盘失败时内存变更随快照一并回滚，
 // 返回错误与零值事项，不把尚未保存的关闭状态当作关闭结果。
+// 成功返回的事项是独立副本：改写其中的关闭时刻等字段只影响调用方手中的
+// 结果，不影响系统保存的事项，也不影响其后来进入的班次结束时记录。
 func (svc *Service) CloseItem(itemID, operator string) (Item, error) {
 	itemID = clean(itemID)
 	operator = clean(operator)
@@ -363,7 +366,9 @@ func (svc *Service) CloseItem(itemID, operator string) (Item, error) {
 		it.ClosedAt = &now
 		it.CloseOperator = operator
 		it.Events = append(it.Events, ItemEvent{At: now, Kind: "closed", Operator: operator})
-		closed = *it
+		// 返回深拷贝：调用方改写这份关闭结果中的关闭时刻等字段只影响手中
+		// 结果，不随共享指针写回系统保存的事项（及其后进入的结束时记录）。
+		closed = cloneItem(*it)
 		return nil
 	})
 	if err != nil {
@@ -379,6 +384,11 @@ func (svc *Service) CloseItem(itemID, operator string) (Item, error) {
 // 结束成功时把在班事项（本班新增与已接收，含结束前已关闭者）冻结为结束时记录；
 // 校验或保存失败时不留下任何记录，班次保持进行中，也不改变交接结果、
 // 事项归属与已保存的处理经过。
+// 返回的班次结果与系统保存的结束时记录相互独立（结束时刻、结束时清单与
+// 每项关闭时间都各是一份副本）：调用方为本地展示改动手中结果只能影响这份
+// 结果，不改写系统中已结束班次的事实，也不影响其他已取得的班次结果或报告；
+// 结束前已关闭事项在结束时记录中保留当时的关闭人与关闭时间，与关闭事项操作
+// 所得结果中的关闭时间互不共享。
 func (svc *Service) CloseShift(shiftID string) (Shift, error) {
 	shiftID = clean(shiftID)
 	var result Shift
@@ -402,7 +412,9 @@ func (svc *Service) CloseShift(shiftID string) (Shift, error) {
 		sh.ClosedAt = &now
 
 		// 冻结结束时在班的全部事项。退回或未确认的交接事项当前班次仍在交班
-		// 班次，不会被快照；结束前已关闭的事项保留关闭人与关闭时间。
+		// 班次，不会被快照；结束前已关闭的事项保留关闭人与关闭时间。关闭时间
+		// 复制一份独立指针：结束时记录一经写定，调用方改写关闭事项操作所得
+		// 结果中的关闭时刻不能影响这里保留的历史值。
 		record := &ShiftCloseRecord{Items: []CloseItemSnapshot{}}
 		for i := range d.Items {
 			it := &d.Items[i]
@@ -416,14 +428,17 @@ func (svc *Service) CloseShift(shiftID string) (Shift, error) {
 				Constraints:   it.Constraints,
 				FollowOwner:   it.FollowOwner,
 				Closed:        it.Closed,
-				ClosedAt:      it.ClosedAt,
+				ClosedAt:      cloneTimePtr(it.ClosedAt),
 				CloseOperator: it.CloseOperator,
 			})
 		}
 		sort.Slice(record.Items, func(i, j int) bool { return record.Items[i].ItemID < record.Items[j].ItemID })
 		sh.CloseRecord = record
 
-		result = *sh
+		// 返回深拷贝：调用方为本地展示改动手中的班次结果（实际结束时刻、
+		// 结束时事项内容、清单条目或某项关闭时间）只能影响这份结果，不随
+		// 共享指针写回系统保存的记录，也不影响其他已取得的班次结果。
+		result = cloneShift(*sh)
 		return nil
 	})
 	return result, err
