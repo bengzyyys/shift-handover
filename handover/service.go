@@ -1,6 +1,7 @@
 package handover
 
 import (
+	"errors"
 	"fmt"
 	"sort"
 	"strings"
@@ -465,6 +466,13 @@ func (svc *Service) CloseShift(shiftID string) (Shift, error) {
 // ErrHandoverTarget 并指出原接班班次，无论新对象是否结束都不产生第二条交接。
 // 不存在的班次编号与交给自身始终按各自错误拒绝；同岗位及接班班次尚未结束等
 // 要求仅对首次发起生效。
+// 只有本地数据保存成功，首次发起才算建立：输入与班次状态均合法、真正进入
+// 保存阶段后因数据无法写入或无法保存而失败时，内存变更随快照一并回滚，保留
+// 原有保存错误（能说明保存在哪一步失败）并返回零值交接（无编号、无岗位、
+// 无两班编号、发起时间为零值、完成时间为空、清单没有事项），不把尚未保存的
+// 编号、发起时间、清单（空清单时连同完成时间）当作已建立的记录交给调用方，
+// 也不用旧记录或部分清单充当本次结果；失败尝试不占用交接编号、不留下已指定
+// 接班对象的关系。带未关闭事项与没有未关闭事项（空清单）的首次发起都一样。
 func (svc *Service) CreateHandover(fromShiftID, toShiftID string) (Handover, error) {
 	fromShiftID = clean(fromShiftID)
 	toShiftID = clean(toShiftID)
@@ -560,7 +568,19 @@ func (svc *Service) CreateHandover(fromShiftID, toShiftID string) (Handover, err
 		result = cloneHandover(h)
 		return nil
 	})
-	return result, err
+	if err != nil {
+		if errors.Is(err, ErrHandoverExists) {
+			// 重复发起的既有承诺：连同“已存在”错误返回保存的原记录副本，
+			// 命令行据此把它作为成功展示；接班班次随后结束也仍返回原记录。
+			return result, err
+		}
+		// 业务拒绝或保存失败都不交出交接结果。保存失败时内存已回滚，闭包里
+		// 赋给 result 的那份新交接尚未保存（编号、发起时间、清单，空清单时
+		// 连同完成时间），不能当作已建立的记录返回；保留原错误（含保存失败
+		// 的具体步骤），改报成业务校验或成功都不允许。
+		return Handover{}, err
+	}
+	return result, nil
 }
 
 // ProcessEntry 由接班人逐项处理交接事项，须填写操作人。
