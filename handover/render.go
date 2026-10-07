@@ -54,7 +54,7 @@ func FormatItem(it Item) string {
 func writeItemHeader(b *strings.Builder, it Item) {
 	state := "未关闭"
 	if it.Closed {
-		state = fmt.Sprintf("已关闭（%s 于 %s）", it.CloseOperator, fmtTimePtr(it.ClosedAt))
+		state = formatClosedState("已关闭", it.CloseOperator, it.ClosedAt)
 	}
 	fmt.Fprintf(b, "%s  严重程度=%s  当前班次=%s  原始班次=%s  [%s]\n",
 		it.ID, it.Severity.Label(), it.CurrentShiftID, it.OriginShiftID, state)
@@ -103,6 +103,35 @@ func fmtProcessedAtIfRecorded(t *time.Time) string {
 		return "未记录"
 	}
 	return fmtTime(*t)
+}
+
+// formatClosedState 是事项关闭信息在展示层的统一解读，item-show 的最新状态与
+// shift-show 的当前事项、结束时记录、最新状态对照共用，保证同一份关闭信息在
+// 各处解释一致。prefix 为“已关闭”或“结束时已关闭”。
+//
+// 只按已保存事实展示，不补齐、不推测：
+//   - 事项保存的关闭状态为已关闭时，结论固定为已关闭，不能因为关闭人或关闭
+//     时间缺失而改成未关闭；保存状态为未关闭时由调用方另行展示，残留的关闭人
+//     或时间不作为一次有效关闭；
+//   - 关闭人未保存或为空显示“未记录”；关闭时间未保存（nil）或为旧数据零值
+//     （0001-01-01T00:00:00Z）同样显示“未记录”，不显示横线或公元元年日期；
+//   - 姓名与时间分别判断：有姓名无时间保留姓名并指出关闭时间未记录，有真实
+//     时间无姓名保留带时区的实际时间并指出关闭人未记录，缺一个不隐藏另一个，
+//     也不以班次负责人或处理经过中的信息代替；
+//   - 两者都有记录时沿用原有“姓名 于 时间”格式。
+func formatClosedState(prefix, operator string, closedAt *time.Time) string {
+	hasOperator := operator != ""
+	hasTime := closedAt != nil && !closedAt.IsZero()
+	switch {
+	case hasOperator && hasTime:
+		return fmt.Sprintf("%s（%s 于 %s）", prefix, operator, fmtTime(*closedAt))
+	case hasOperator:
+		return fmt.Sprintf("%s（关闭人 %s，关闭时间未记录）", prefix, operator)
+	case hasTime:
+		return fmt.Sprintf("%s（关闭人未记录，关闭时间 %s）", prefix, fmtTime(*closedAt))
+	default:
+		return prefix + "（关闭人未记录，关闭时间未记录）"
+	}
 }
 
 // currentProcessing 返回交接单项当前处理结果的处理人与处理时间展示，是
@@ -284,7 +313,7 @@ func FormatCloseItem(snap CloseItemSnapshot, latest *Item) string {
 	var b strings.Builder
 	state := "结束时未关闭"
 	if snap.Closed {
-		state = fmt.Sprintf("结束时已关闭（%s 于 %s）", snap.CloseOperator, fmtTimePtr(snap.ClosedAt))
+		state = formatClosedState("结束时已关闭", snap.CloseOperator, snap.ClosedAt)
 	}
 	fmt.Fprintf(&b, "%s  严重程度=%s  %s\n", snap.ItemID, snap.Severity.Label(), state)
 	fmt.Fprintf(&b, "  内容：%s\n", snap.Content)
@@ -296,7 +325,7 @@ func FormatCloseItem(snap CloseItemSnapshot, latest *Item) string {
 	}
 	closeState := "未关闭"
 	if latest.Closed {
-		closeState = fmt.Sprintf("已关闭（%s 于 %s）", latest.CloseOperator, fmtTimePtr(latest.ClosedAt))
+		closeState = formatClosedState("已关闭", latest.CloseOperator, latest.ClosedAt)
 	}
 	fmt.Fprintf(&b, "  最新状态：当前所在班次=%s  最新负责人=%s  最新关闭情况=%s\n",
 		latest.CurrentShiftID, latest.FollowOwner, closeState)
