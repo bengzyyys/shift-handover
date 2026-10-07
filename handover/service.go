@@ -107,7 +107,18 @@ func currentItemsOfShift(d *Data, shiftID string) []Item {
 	return out
 }
 
-func hasNote(d *Data, a, b string) bool { return findNote(d, a, b) != nil }
+// hasEffectiveNote 报告两个班次之间是否已保存至少一条有效重叠说明：
+// 正文去掉首尾空白后仍有内容。记录存在但正文缺失、为空或全是空白
+// （空格、制表符、换行）都不算已说明；与存放次序无关，只认有效正文。
+func hasEffectiveNote(d *Data, a, b string) bool {
+	x, y := notePair(a, b)
+	for i := range d.Notes {
+		if d.Notes[i].ShiftA == x && d.Notes[i].ShiftB == y && clean(d.Notes[i].Note) != "" {
+			return true
+		}
+	}
+	return false
+}
 
 // CreateShift 建立班次。岗位、负责人必填，结束时间必须晚于开始时间。
 // 同一岗位按实际时刻比较区间：前班结束恰好等于后班开始不算重叠；
@@ -516,7 +527,8 @@ func (svc *Service) CreateHandover(fromShiftID, toShiftID string) (Handover, err
 		}
 
 		// 以下为首次发起的要求：接班班次尚未结束、开始时间不早于交班班次、
-		// 交班班次已经结束，重叠区间须有说明。
+		// 交班班次已经结束，重叠区间须有有效说明（正文去掉首尾空白后仍有内容，
+		// 只凭说明记录存在不算）。
 		if to.Closed {
 			return fmt.Errorf("%w：接班班次 %s 已结束，不能交接", ErrShiftClosed, to.ID)
 		}
@@ -529,7 +541,7 @@ func (svc *Service) CreateHandover(fromShiftID, toShiftID string) (Handover, err
 			return fmt.Errorf("%w：交班班次 %s 尚未结束，结束班次后未关闭事项才成为交接清单",
 				ErrShiftNotClosed, from.ID)
 		}
-		if intervalsOverlap(from.Start, from.End, to.Start, to.End) && !hasNote(d, from.ID, to.ID) {
+		if intervalsOverlap(from.Start, from.End, to.Start, to.End) && !hasEffectiveNote(d, from.ID, to.ID) {
 			return fmt.Errorf("%w：交班班次 %s 与接班班次 %s 时间区间重叠，须先填写重叠说明",
 				ErrOverlap, from.ID, to.ID)
 		}

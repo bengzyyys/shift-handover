@@ -3,6 +3,7 @@ package handover
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -203,5 +204,155 @@ func TestCreateShiftSpanningTwoShiftsRequiresNote(t *testing.T) {
 	notes := f.svc.OverlapNotes(created.ID)
 	if len(notes) != 2 || notes[0].ID != "N001" || notes[1].ID != "N002" {
 		t.Fatalf("说明编号应从 N001 继续，got %+v", notes)
+	}
+}
+
+// TestCreateHandoverBlankOverlapNoteDoesNotCount：两班时间确实重叠时，发起交接
+// 以实际保存的说明正文为准。本地数据中只存在正文缺失、为空或全是空白（空格、
+// 制表符、换行）的说明记录时不能放行：handover-create 明确失败并指出两班编号、
+// 提示先填写重叠说明，不留下新交接、不指定接班关系、不改变事项归属；只关联其中
+// 一个班次、实际属于另一对班次的有效说明也不能借用。通过 note-add 追加非空说明
+// 后可重新发起，较早的空白记录不能挡住它，且空白记录仍保留可查。
+func TestCreateHandoverBlankOverlapNoteDoesNotCount(t *testing.T) {
+	f := newFixture(t)
+	a := mustShift(t, f, "调度", "张三", ts(8, 0), ts(16, 0), "")
+	if _, err := f.svc.AddItem(a.ID, "未关闭事项", SeverityImportant, "", "李四"); err != nil {
+		t.Fatalf("add item: %v", err)
+	}
+	b := mustShift(t, f, "调度", "李四", ts(15, 0), ts(23, 0), "抢修并行")
+	// 另一对班次 (b,c) 的有效说明：只关联 b，不能借给 (a,b) 使用。
+	c := mustShift(t, f, "调度", "王五", ts(22, 0), tsDay(3, 6, 0), "夜间并班")
+	if got := f.svc.OverlapNotes(c.ID); len(got) != 1 {
+		t.Fatalf("(b,c) 应保存一条有效说明，got %+v", got)
+	}
+
+	// 模拟本地数据中 (a,b) 的说明记录正文缺失、为空或全是空白：
+	// 记录存在，但没有任何有效正文。
+	x, y := notePair(a.ID, b.ID)
+	blanks := []string{"", "   ", "\t \n"}
+	notes := []OverlapNote{}
+	for _, n := range f.store.data.Notes {
+		if n.ShiftA == x && n.ShiftB == y {
+			continue // 去掉建立时保存的有效说明，换成空白记录
+		}
+		notes = append(notes, n)
+	}
+	for i, body := range blanks {
+		notes = append(notes, OverlapNote{
+			ID:        fmt.Sprintf("N9%02d", i+1),
+			Position:  "调度",
+			ShiftA:    x,
+			ShiftB:    y,
+			Note:      body,
+			CreatedAt: f.clock,
+		})
+	}
+	f.store.data.Notes = notes
+
+	if _, err := f.svc.CloseShift(a.ID); err != nil {
+		t.Fatalf("close a: %v", err)
+	}
+
+	// 只有空白说明记录：不允许发起交接，错误指出两班编号并提示先填说明。
+	_, err := f.svc.CreateHandover(a.ID, b.ID)
+	if !errors.Is(err, ErrOverlap) {
+		t.Fatalf("只有空白说明记录时应报 ErrOverlap，got %v", err)
+	}
+	if !strings.Contains(err.Error(), a.ID) || !strings.Contains(err.Error(), b.ID) {
+		t.Fatalf("错误应指出两班编号 %s 与 %s，got %v", a.ID, b.ID, err)
+	}
+	if !strings.Contains(err.Error(), "重叠说明") {
+		t.Fatalf("错误应提示先填写重叠说明，got %v", err)
+	}
+
+	// 不留下新交接、不指定接班关系、不改变事项归属。
+	if hs := f.svc.ListHandovers(); len(hs) != 0 {
+		t.Fatalf("失败后不应留下交接，got %+v", hs)
+	}
+	it, err := f.svc.GetItem("I001")
+	if err != nil {
+		t.Fatalf("get item: %v", err)
+	}
+	if it.CurrentShiftID != a.ID {
+		t.Fatalf("事项归属不应改变，got %s", it.CurrentShiftID)
+	}
+
+	// 通过 note-add 追加非空说明后可重新发起；较早的空白记录不能挡住它。
+	if _, err := f.svc.AddOverlapNote(a.ID, b.ID, "抢修期间两班并行，已口头交接"); err != nil {
+		t.Fatalf("note-add: %v", err)
+	}
+	h, err := f.svc.CreateHandover(a.ID, b.ID)
+	if err != nil {
+		t.Fatalf("追加有效说明后应能发起交接：%v", err)
+	}
+	if h.FromShiftID != a.ID || h.ToShiftID != b.ID {
+		t.Fatalf("交接关系错误：%+v", h)
+	}
+
+	// 空白记录与有效说明都保留可查，不需要删除或覆盖历史记录。
+	pairNotes := []OverlapNote{}
+	for _, n := range f.svc.OverlapNotes(a.ID) {
+		if n.ShiftA == x && n.ShiftB == y {
+			pairNotes = append(pairNotes, n)
+		}
+	}
+	if len(pairNotes) != len(blanks)+1 {
+		t.Fatalf("空白记录与有效说明都应保留，got %+v", pairNotes)
+	}
+}
+
+// TestCreateHandoverLaterBlankNoteDoesNotInvalidate：同一对班次先保存了有效
+// 说明，之后又出现更晚存放的空白记录时，已有说明不失效，仍可发起交接。
+func TestCreateHandoverLaterBlankNoteDoesNotInvalidate(t *testing.T) {
+	f := newFixture(t)
+	a := mustShift(t, f, "调度", "张三", ts(8, 0), ts(16, 0), "")
+	b := mustShift(t, f, "调度", "李四", ts(15, 0), ts(23, 0), "抢修并行")
+	x, y := notePair(a.ID, b.ID)
+	// 较晚存放的空白记录不能使已有有效说明失效。
+	f.store.data.Notes = append(f.store.data.Notes, OverlapNote{
+		ID: "N900", Position: "调度", ShiftA: x, ShiftB: y, Note: "  \n\t ",
+		CreatedAt: f.clock,
+	})
+	if _, err := f.svc.CloseShift(a.ID); err != nil {
+		t.Fatalf("close a: %v", err)
+	}
+	if _, err := f.svc.CreateHandover(a.ID, b.ID); err != nil {
+		t.Fatalf("已有有效说明时不应被较晚的空白记录挡住：%v", err)
+	}
+}
+
+// TestCreateHandoverEmptyListRequiresEffectiveNote：重叠班次即使没有未关闭
+// 事项，首次发起空清单交接也必须满足同一说明要求；追加有效说明后空清单
+// 交接可以发起并直接完成。
+func TestCreateHandoverEmptyListRequiresEffectiveNote(t *testing.T) {
+	f := newFixture(t)
+	a := mustShift(t, f, "调度", "张三", ts(8, 0), ts(16, 0), "")
+	b := mustShift(t, f, "调度", "李四", ts(15, 0), ts(23, 0), "并行")
+	// 把 (a,b) 的说明正文改成空白，模拟只保存了空记录的本地数据。
+	x, y := notePair(a.ID, b.ID)
+	for i := range f.store.data.Notes {
+		if f.store.data.Notes[i].ShiftA == x && f.store.data.Notes[i].ShiftB == y {
+			f.store.data.Notes[i].Note = " \t\n "
+		}
+	}
+	if _, err := f.svc.CloseShift(a.ID); err != nil {
+		t.Fatalf("close a: %v", err)
+	}
+	if _, err := f.svc.CreateHandover(a.ID, b.ID); !errors.Is(err, ErrOverlap) {
+		t.Fatalf("空清单交接只有空白说明时也应报 ErrOverlap，got %v", err)
+	}
+	if hs := f.svc.ListHandovers(); len(hs) != 0 {
+		t.Fatalf("失败后不应留下交接，got %+v", hs)
+	}
+	// 追加有效说明后空清单交接可以发起并直接完成。
+	if _, err := f.svc.AddOverlapNote(a.ID, b.ID, "抢修并行半小时"); err != nil {
+		t.Fatalf("note-add: %v", err)
+	}
+	h, err := f.svc.CreateHandover(a.ID, b.ID)
+	if err != nil {
+		t.Fatalf("追加有效说明后应能发起空清单交接：%v", err)
+	}
+	if h.CompletedAt == nil {
+		t.Fatalf("空清单交接应在发起时完成：%+v", h)
 	}
 }
