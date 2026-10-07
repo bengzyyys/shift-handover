@@ -158,7 +158,7 @@ func TestTrackSaveFailureAtomicRollback(t *testing.T) {
 
 	// 使下一次写盘在原子保存阶段失败。
 	breakSaving(t, f)
-	_, err = f.svc.ProcessEntry(h.ID, idLast, ActionTrack, "李四", "", "持续跟踪压力变化", "王五")
+	failed, err := f.svc.ProcessEntry(h.ID, idLast, ActionTrack, "李四", "", "持续跟踪压力变化", "王五")
 	// 操作必须明确返回错误，且这是保存错误而不是业务拒绝
 	// （不能用缺少跟踪说明、负责人为空或事项已接收等来冒充）。
 	if err == nil {
@@ -170,6 +170,10 @@ func TestTrackSaveFailureAtomicRollback(t *testing.T) {
 	if errors.Is(err, ErrInvalidInput) || errors.Is(err, ErrHandoverState) || errors.Is(err, ErrNotFound) {
 		t.Fatalf("参数合法、状态允许时的保存失败不应被报告为业务校验错误，got %v", err)
 	}
+	// 调用方拿不到本次尝试形成的交接结果：没有编号、岗位、两班编号，发起
+	// 时间为零值，完成时间为空，清单没有事项——既不能借这份结果宣称最后一项
+	// 已接收或整份交接完成，也不能拿失败前的整份交接充当处理结果。
+	assertZeroHandoverResult(t, failed)
 
 	// 当前打开的数据中不留半完成结果。
 	assertLastItemStillPending(t, f, h.ID, a.ID, b.ID, idLast, idFirst, confirmAt)

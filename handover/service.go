@@ -601,6 +601,13 @@ func (svc *Service) CreateHandover(fromShiftID, toShiftID string) (Handover, err
 // 最后一项成功接收使整份交接首次全部明确接收时，完成时间记为本次成功处理时间；
 // 若记录里存在补齐前误写（或零值）的旧完成时间，一并以本次时间覆盖。本次处理失败、
 // 退回或仍有未接收项时不写完成时间，交接不能提前完成。
+// 只有本地数据保存成功才算处理完成：输入合法、该项允许处理且实际进入保存阶段后，
+// 无论写入临时文件失败还是最终保存失败，内存变更都随快照一并回滚，返回原保存错误
+// 与零值交接结果（编号、岗位、两班编号为空，发起时间为零值，完成时间为空，清单
+// 没有事项），不把本次尝试形成的处理状态、操作人、处理时间、跟踪说明、新增退回
+// 轮次或交接完成时间当作处理结果，也不返回失败前的整份交接充当处理结果；最后一项
+// 的失败尝试同样不能通过返回结果宣称整份交接完成。输入不合法或状态不允许的业务
+// 拒绝发生在保存之前，同样不返回交接结果。
 func (svc *Service) ProcessEntry(handoverID, itemID string, action EntryAction, operator, reason, trackingNote, nextFollowOwner string) (Handover, error) {
 	handoverID = clean(handoverID)
 	itemID = clean(itemID)
@@ -703,7 +710,12 @@ func (svc *Service) ProcessEntry(handoverID, itemID string, action EntryAction, 
 		result = cloneHandover(*h)
 		return nil
 	})
-	return result, err
+	if err != nil {
+		// 业务拒绝发生在 result 赋值之前；保存失败时内存已随快照回滚。两种
+		// 情况都不能把本次尝试或失败前的交接当作处理结果交给调用方。
+		return Handover{}, err
+	}
+	return result, nil
 }
 
 // validProcessedAt 报告处理时间是否真实记录：nil 或零值

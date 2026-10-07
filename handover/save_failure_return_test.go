@@ -382,7 +382,7 @@ func TestReturnSaveFailureFirstAtomicRollback(t *testing.T) {
 
 	// 操作人有效、原因非空、事项待处理允许退回；使下一次写盘在原子保存阶段失败。
 	breakSaving(t, f)
-	_, err = f.svc.ProcessEntry(h.ID, idA, ActionReturn, want.failedOperator, want.failedReason, "", "")
+	failed, err := f.svc.ProcessEntry(h.ID, idA, ActionReturn, want.failedOperator, want.failedReason, "", "")
 	if err == nil {
 		t.Fatalf("保存失败时退回应明确返回错误，不能返回成功退回的结果")
 	}
@@ -394,6 +394,9 @@ func TestReturnSaveFailureFirstAtomicRollback(t *testing.T) {
 	if errors.Is(err, ErrInvalidInput) || errors.Is(err, ErrHandoverState) || errors.Is(err, ErrNotFound) {
 		t.Fatalf("参数合法、状态允许时的保存失败不应被报告为业务校验错误，got %v", err)
 	}
+	// 返回给调用方的只能是零值交接结果：不能带本次尚未保存的退回状态、操作人、
+	// 处理时间或新增的第1轮退回，也不能把失败前的整份交接当作退回结果。
+	assertZeroHandoverResult(t, failed)
 
 	// 当前打开的数据上查看交接与处理经过，应看到失败前的事实，而不是只保证
 	// 文件没变、查询却显示已经退回。
@@ -607,7 +610,7 @@ func TestReturnSaveFailureSecondAfterResubmitAtomicRollback(t *testing.T) {
 
 	// 再次退回：操作人有效、原因非空、事项待处理允许退回；写盘在保存阶段失败。
 	breakSaving(t, f)
-	_, err = f.svc.ProcessEntry(h.ID, idA, ActionReturn, want.failedOperator, want.failedReason, "", "")
+	failed, err := f.svc.ProcessEntry(h.ID, idA, ActionReturn, want.failedOperator, want.failedReason, "", "")
 	if err == nil {
 		t.Fatalf("保存失败时再次退回应明确返回错误，不能返回成功退回的结果")
 	}
@@ -617,6 +620,9 @@ func TestReturnSaveFailureSecondAfterResubmitAtomicRollback(t *testing.T) {
 	if errors.Is(err, ErrInvalidInput) || errors.Is(err, ErrHandoverState) || errors.Is(err, ErrNotFound) {
 		t.Fatalf("参数合法、状态允许时的保存失败不应被报告为业务校验错误，got %v", err)
 	}
+	// 返回零值交接结果：不能带本次尚未保存的第2轮退回，也不能把失败前保留着
+	// 第一轮记录的整份交接当作再次退回的结果。
+	assertZeroHandoverResult(t, failed)
 
 	assertPendingAfterOneRound(t, f, want)
 
