@@ -52,10 +52,10 @@ func FormatItem(it Item) string {
 // writeItemHeader 输出事项的最新内容、严重程度、限制条件、后续负责人、
 // 当前所在班次、关闭情况和流经班次。
 func writeItemHeader(b *strings.Builder, it Item) {
-	state := "未关闭"
-	if it.Closed {
-		state = fmt.Sprintf("已关闭（%s 于 %s）", it.CloseOperator, fmtTimePtr(it.ClosedAt))
-	}
+	// 关闭情况只以已保存的关闭状态为准：已关闭时关闭人与关闭时间各自独立
+	// 展示（见 viewCloseInfo），缺项明确标为未记录；未关闭时即使旧数据残留
+	// 关闭人或时间也按未关闭展示，不把残留值当作一次有效关闭。
+	state := viewCloseInfo(it.Closed, it.CloseOperator, it.ClosedAt).stateText("")
 	fmt.Fprintf(b, "%s  严重程度=%s  当前班次=%s  原始班次=%s  [%s]\n",
 		it.ID, it.Severity.Label(), it.CurrentShiftID, it.OriginShiftID, state)
 	fmt.Fprintf(b, "  内容：%s\n", it.Content)
@@ -103,6 +103,66 @@ func fmtProcessedAtIfRecorded(t *time.Time) string {
 		return "未记录"
 	}
 	return fmtTime(*t)
+}
+
+// closeInfoView 是一份关闭信息在展示层的统一解读。item-show 的事项最新状态
+// 与 shift-show 的结束时记录、最新状态对照共用同一份判断，只保留各自的措辞
+// 与前缀——统一维护的是共同规则，不是把各处改成同一种文本。
+//
+// 关闭与否只看已保存的关闭状态：状态为已关闭就按已关闭展示，关闭人或关闭
+// 时间缺失不能使它变成未关闭；状态为未关闭时，即使旧数据残留关闭人或时间，
+// 也不把它们当作一次有效关闭展示。
+//
+// 已关闭时关闭人与关闭时间各自独立判断：人名有值保留原姓名、未保存或为空
+// 明确显示未记录；时间有真实值沿用带时区格式，未保存（nil）或为旧数据零值
+// （0001-01-01T00:00:00Z）同样显示未记录。缺其中一个不隐藏另一个，也不
+// 从事项最新值、班次负责人或处理经过补齐。
+type closeInfoView struct {
+	Closed        bool
+	operatorKnown bool
+	operator      string
+	timeKnown     bool
+	at            string
+}
+
+// viewCloseInfo 按共同规则解读已保存的关闭信息，只做展示判断，不补齐、
+// 不推测。未关闭时不解读残留的关闭人或时间。
+func viewCloseInfo(closed bool, operator string, at *time.Time) closeInfoView {
+	v := closeInfoView{Closed: closed}
+	if !closed {
+		return v
+	}
+	if operator != "" {
+		v.operatorKnown = true
+		v.operator = operator
+	}
+	if at != nil && !at.IsZero() {
+		v.timeKnown = true
+		v.at = fmtTime(*at)
+	}
+	return v
+}
+
+// stateText 返回关闭状态文本。prefix 只用于结束时记录（“结束时”）：
+//   - 未关闭：prefix + “未关闭”，不展示任何残留关闭信息；
+//   - 两者都有记录：沿用原有句式“已关闭（姓名 于 时间）”；
+//   - 缺关闭人或缺关闭时间：保留已有的一项，缺项明确标为未记录。
+func (v closeInfoView) stateText(prefix string) string {
+	if !v.Closed {
+		return prefix + "未关闭"
+	}
+	var inner string
+	switch {
+	case v.operatorKnown && v.timeKnown:
+		inner = fmt.Sprintf("%s 于 %s", v.operator, v.at)
+	case v.operatorKnown:
+		inner = fmt.Sprintf("%s，关闭时间未记录", v.operator)
+	case v.timeKnown:
+		inner = fmt.Sprintf("关闭人未记录，于 %s", v.at)
+	default:
+		inner = "关闭人未记录，关闭时间未记录"
+	}
+	return prefix + "已关闭（" + inner + "）"
 }
 
 // currentProcessing 返回交接单项当前处理结果的处理人与处理时间展示，是
@@ -282,10 +342,10 @@ func FormatItemJourney(j ItemJourney) string {
 // FormatCloseItem 格式化班次结束时冻结的事项记录，并与最新状态对照。
 func FormatCloseItem(snap CloseItemSnapshot, latest *Item) string {
 	var b strings.Builder
-	state := "结束时未关闭"
-	if snap.Closed {
-		state = fmt.Sprintf("结束时已关闭（%s 于 %s）", snap.CloseOperator, fmtTimePtr(snap.ClosedAt))
-	}
+	// 结束时记录与最新状态对照共用同一份关闭信息解读（见 viewCloseInfo），
+	// 但各自只解读自己保存的关闭人/关闭时间：结束时记录中的缺项只在结束时
+	// 信息中标出，不从事项最新值、班次负责人或处理经过补齐。
+	state := viewCloseInfo(snap.Closed, snap.CloseOperator, snap.ClosedAt).stateText("结束时")
 	fmt.Fprintf(&b, "%s  严重程度=%s  %s\n", snap.ItemID, snap.Severity.Label(), state)
 	fmt.Fprintf(&b, "  内容：%s\n", snap.Content)
 	fmt.Fprintf(&b, "  限制条件：%s\n", dashIfEmpty(snap.Constraints))
@@ -294,10 +354,7 @@ func FormatCloseItem(snap CloseItemSnapshot, latest *Item) string {
 		b.WriteString("  最新状态：事项记录已不存在\n")
 		return b.String()
 	}
-	closeState := "未关闭"
-	if latest.Closed {
-		closeState = fmt.Sprintf("已关闭（%s 于 %s）", latest.CloseOperator, fmtTimePtr(latest.ClosedAt))
-	}
+	closeState := viewCloseInfo(latest.Closed, latest.CloseOperator, latest.ClosedAt).stateText("")
 	fmt.Fprintf(&b, "  最新状态：当前所在班次=%s  最新负责人=%s  最新关闭情况=%s\n",
 		latest.CurrentShiftID, latest.FollowOwner, closeState)
 	return b.String()
