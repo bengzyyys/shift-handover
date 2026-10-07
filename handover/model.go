@@ -267,7 +267,9 @@ type ItemJourney struct {
 	HasHandovers bool           // false 表示尚未参与交接
 }
 
-// EntryView 把交接单项与其所属交接编号关联，用于按班次查询。
+// EntryView 把交接单项与其所属交接编号关联。item-show 按事项列出该事项参与
+// 的各次交接、shift-show 按班次汇总本班直接交班或接班的交接，两处共用同一
+// 组装规则（见 entry_results.go），Entry 总是对应交接保存值的独立深拷贝。
 type EntryView struct {
 	HandoverID string
 	FromShift  string
