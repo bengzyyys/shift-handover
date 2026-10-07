@@ -214,22 +214,22 @@ func viewReturnRounds(rounds []ReturnRound) []returnRoundView {
 }
 
 // entryCurrentResultLabel 是交接当前结果在事项处理经过查询中的展示名。
+// 结果名称本身与交接清单、班次报告共用 EntryStatus.Label（model.go）：
 // 缺失或空结果显示“处理结果未记录”，无法识别的结果显示“处理结果无法识别”
-// 并带出保存的原值，与交接清单、班次报告表达同一事实，不推测成已接收。
+// 并带出保存的原值；这里只在事项查询需要额外语境的四种结果上补充说明，
+// 不另维护一份结果名称与原值的解读规则。
 func entryCurrentResultLabel(s EntryStatus) string {
 	switch s {
 	case EntryPending:
-		return "待处理（接班人尚未处理）"
+		return s.Label() + "（接班人尚未处理）"
 	case EntryReturned:
-		return "退回（等待交班人补充）"
-	case EntryConfirmed:
-		return "确认接收"
+		return s.Label() + "（等待交班人补充）"
 	case EntryTracking:
-		return "继续跟踪（已接收）"
-	case "":
-		return "处理结果未记录"
+		return s.Label() + "（已接收）"
+	default:
+		// 确认接收沿用 Label 原名；空结果与无法识别的原值也由 Label 统一解读。
+		return s.Label()
 	}
-	return "处理结果无法识别（原值：" + string(s) + "）"
 }
 
 // FormatJourneyEvent 格式化处理经过中的单条记录。交接相关记录带有交接

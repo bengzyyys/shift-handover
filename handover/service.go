@@ -935,7 +935,7 @@ func cloneHandover(h Handover) Handover {
 func (svc *Service) ShiftReport(shiftID string) (ShiftReport, error) {
 	shiftID = clean(shiftID)
 	d := &svc.store.data
-	rep := ShiftReport{Results: map[string][]EntryView{}, LatestItems: map[string]Item{}}
+	rep := ShiftReport{LatestItems: map[string]Item{}}
 	sh, _ := findShift(d, shiftID)
 	if sh == nil {
 		return ShiftReport{}, fmt.Errorf("%w：班次 %s", ErrNotFound, shiftID)
@@ -976,12 +976,17 @@ func (svc *Service) ShiftReport(shiftID string) (ShiftReport, error) {
 		rep.Items[i] = cloneItem(rep.Items[i])
 	}
 
+	// 只汇总与所查班次有直接交班或接班关系的交接；同一事项既交入又交出时，
+	// 两条结果分别保留，不混入该事项在其他班次之间的交接。各项交接当前结果
+	// 的整理（条目、副本与按交接编号的次序）与 item-show 共用同一实现，
+	// 见 entry_views.go。
+	involved := []*Handover{}
 	for i := range d.Handovers {
 		h := &d.Handovers[i]
-		involved := h.FromShiftID == sh.ID || h.ToShiftID == sh.ID
-		if !involved {
+		if h.FromShiftID != sh.ID && h.ToShiftID != sh.ID {
 			continue
 		}
+		involved = append(involved, h)
 		if h.FromShiftID == sh.ID {
 			cp := cloneHandover(*h)
 			rep.Outgoing = &cp
@@ -989,18 +994,8 @@ func (svc *Service) ShiftReport(shiftID string) (ShiftReport, error) {
 		if h.ToShiftID == sh.ID {
 			rep.Incoming = append(rep.Incoming, cloneHandover(*h))
 		}
-		for j := range h.Entries {
-			rep.Results[h.Entries[j].ItemID] = append(rep.Results[h.Entries[j].ItemID], EntryView{
-				HandoverID: h.ID,
-				FromShift:  h.FromShiftID,
-				ToShift:    h.ToShiftID,
-				Entry:      cloneEntry(h.Entries[j]),
-			})
-		}
 	}
+	rep.Results = entryViewsByItem(involved)
 	sort.Slice(rep.Incoming, func(i, j int) bool { return rep.Incoming[i].ID < rep.Incoming[j].ID })
-	for k := range rep.Results {
-		sort.Slice(rep.Results[k], func(i, j int) bool { return rep.Results[k][i].HandoverID < rep.Results[k][j].HandoverID })
-	}
 	return rep, nil
 }

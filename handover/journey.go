@@ -8,8 +8,9 @@ import (
 // 本文件只承载 item-show 查询结果（ItemJourney）的组装。组装拆成四个相互
 // 独立的阶段，各自只依赖已保存数据，互不穿插：
 //
-//   - 各次交接当前结果的整理：entryResults 按交接编号汇总该事项在每次交接
-//     中的当前处理结果（EntryView），与处理经过的生成无关；
+//   - 各次交接当前结果的整理：entryViewsForItem（见 entry_views.go，与
+//     shift-show 共用同一实现）按交接编号汇总该事项在每次交接中的当前
+//     处理结果（EntryView），与处理经过的生成无关；
 //   - 退回轮次与交接经过的展开：expandHandoverJourney 把一次交接中该事项的
 //     经过展开为事件序列（发起、逐轮退回、补充后重新提交、确认接收或继续
 //     跟踪），不关心其他交接，也不关心事项自身历史；
@@ -52,7 +53,7 @@ func (svc *Service) ItemJourney(itemID string) (ItemJourney, error) {
 	j := ItemJourney{
 		Item:         cloneItem(*it),
 		HasHandovers: len(hs) > 0,
-		Results:      entryResults(hs, itemID),
+		Results:      entryViewsForItem(hs, itemID),
 		Events:       assembleJourneyEvents(it, hs, itemID),
 	}
 	return j, nil
@@ -69,23 +70,6 @@ func itemHandovers(d *Data, itemID string) []*Handover {
 	}
 	sort.Slice(hs, func(i, k int) bool { return hs[i].ID < hs[k].ID })
 	return hs
-}
-
-// entryResults 整理该事项在各次交接中的当前处理结果，按交接编号排列。
-// 每条结果都是独立副本（含处理时间与历次退回/补充记录），改动不影响存储。
-// 这一阶段只读交接清单的当前保存值，不参与处理经过的生成。
-func entryResults(hs []*Handover, itemID string) []EntryView {
-	var out []EntryView
-	for _, h := range hs {
-		e, _ := findEntry(h, itemID)
-		out = append(out, EntryView{
-			HandoverID: h.ID,
-			FromShift:  h.FromShiftID,
-			ToShift:    h.ToShiftID,
-			Entry:      cloneEntry(*e),
-		})
-	}
-	return out
 }
 
 // assembleJourneyEvents 汇总完整处理经过：先逐次交接展开经过并合并接收记录，
